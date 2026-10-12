@@ -1,8 +1,8 @@
 'use client';
 
-import { useCallback, useState } from 'react';
+import { useCallback, useEffect, useState } from 'react';
 import { useLanguage } from '../contexts/LanguageContext';
-import { PowerIcon, ShieldCheckIcon, ShieldIcon, SpinnerIcon } from './icons';
+import { InfoIcon, PowerIcon, ShieldCheckIcon, ShieldIcon, SpinnerIcon } from './icons';
 import Toast from './Toast';
 
 export default function ControlPanel({ dpiStatus, onStatusChange }) {
@@ -11,6 +11,13 @@ export default function ControlPanel({ dpiStatus, onStatusChange }) {
   const [toast, setToast] = useState(null);
   const active = !!dpiStatus.active;
   const closeToast = useCallback(() => setToast(null), []);
+
+  // One-time first-run note (per this computer), dismissible.
+  const [showIntro, setShowIntro] = useState(false);
+  useEffect(() => {
+    try { if (!localStorage.getItem('shroudly_intro_seen')) setShowIntro(true); } catch {}
+  }, []);
+  const dismissIntro = () => { setShowIntro(false); try { localStorage.setItem('shroudly_intro_seen', '1'); } catch {} };
 
   const act = async (fn, okKey, failKey) => {
     if (typeof window === 'undefined' || !window.electron?.[fn]) {
@@ -43,6 +50,22 @@ export default function ControlPanel({ dpiStatus, onStatusChange }) {
   return (
     <>
       {toast && <Toast message={toast.message} detail={toast.detail} type={toast.type} onClose={closeToast} />}
+
+      {showIntro && (
+        <div className="no-drag mx-auto mb-1 mt-4 w-full max-w-sm rounded-[var(--radius-sm)] border px-3.5 py-3"
+             style={{ background: 'var(--accent-soft)', borderColor: 'var(--accent-line)' }}>
+          <div className="flex items-start gap-2.5">
+            <InfoIcon className="mt-[1px] h-4 w-4 shrink-0" style={{ color: 'var(--accent)' }} />
+            <div className="min-w-0 flex-1">
+              <p className="text-[12.5px] leading-snug" style={{ color: 'var(--text-dim)' }}>{t('introText')}</p>
+              <button type="button" onClick={dismissIntro}
+                      className="mt-2 text-[12.5px] font-semibold underline" style={{ color: 'var(--accent)' }}>
+                {t('introGotIt')}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
 
       <div className="flex min-h-full flex-col items-center justify-center gap-7 py-6">
         {/* The shield — the one bold moment */}

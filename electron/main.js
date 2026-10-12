@@ -490,6 +490,17 @@ function scheduleEngineRestart() {
   }, 700);
 }
 
+// Route mode / site list change: re-apply the system proxy (no engine restart).
+const PROXY_SETTINGS = new Set(['routeMode', 'siteList']);
+let proxyReapplyTimer = null;
+function scheduleProxyReapply() {
+  clearTimeout(proxyReapplyTimer);
+  proxyReapplyTimer = setTimeout(() => {
+    if (!engine || !engine.isActive()) return;
+    engine.reapplyProxy().catch((err) => addLog('error', `Proxy update failed: ${err.message}`));
+  }, 700);
+}
+
 /* Is IPv6 actually usable here? A global address alone isn't enough (some
  * networks hand one out without routing it), so also try to reach a public
  * IPv6 host. */
@@ -506,12 +517,14 @@ function ipv6Available() {
   });
 }
 ipcMain.handle('net:ipv6Available', () => ipv6Available());
+ipcMain.handle('settings:defaultSiteList', () => EngineManager.DEFAULT_SITE_LIST);
 ipcMain.handle('presence:get', () => (presence ? presence.online : null));
 ipcMain.handle('presence:refresh', () => (presence ? presence.refresh() : null));
 
 ipcMain.handle('settings:set', (e, key, value) => {
   store.set(key, value);
   if (ENGINE_SETTINGS.has(key)) scheduleEngineRestart();
+  if (PROXY_SETTINGS.has(key)) scheduleProxyReapply();
   if (key === 'language') rebuildTrayMenu();
   if (key === 'autoUpdate' && value !== false && updater && updater.state.status === 'available') updater.download();
   if (key === 'autoStart') {

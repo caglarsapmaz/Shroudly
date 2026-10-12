@@ -91,18 +91,44 @@ class SystemProxy {
     this.pacPort = 0;
     this.pacUrl = null;
     this.socksPort = 0;
+    this.mode = 'all';   // 'all' | 'listed'
+    this.list = [];      // domains routed through the proxy in 'listed' mode
     this.watchdog = null;
   }
 
+  /* A PAC that always sends local/private hosts direct. In 'all' mode every
+   * other host goes through the proxy; in 'listed' mode only the domains in
+   * this.list (and their subdomains) do, everything else goes direct. */
   pacBody(port) {
-    return `function FindProxyForURL(url, host) {
-  if (isPlainHostName(host) ||
+    const proxy = `SOCKS5 127.0.0.1:${port}; SOCKS 127.0.0.1:${port}; DIRECT`;
+    const local = `  if (isPlainHostName(host) ||
       shExpMatch(host, "127.*") || shExpMatch(host, "10.*") ||
       shExpMatch(host, "172.16.*") || shExpMatch(host, "192.168.*") ||
       shExpMatch(host, "localhost") || shExpMatch(host, "*.local")) {
     return "DIRECT";
+  }`;
+    if (this.mode === 'listed') {
+      // Clean the list to bare domains, dedupe, and embed as a JS array.
+      const domains = [...new Set((this.list || [])
+        .map((d) => String(d).trim().toLowerCase().replace(/^\*?\.?/, '').replace(/\/.*$/, ''))
+        .filter(Boolean))];
+      return `var SHROUDLY_LIST = ${JSON.stringify(domains)};
+function FindProxyForURL(url, host) {
+${local}
+  host = ("" + host).toLowerCase();
+  for (var i = 0; i < SHROUDLY_LIST.length; i++) {
+    var d = SHROUDLY_LIST[i];
+    if (host === d || host.length > d.length && host.slice(-(d.length + 1)) === ("." + d)) {
+      return "${proxy}";
+    }
   }
-  return "SOCKS5 127.0.0.1:${port}; SOCKS 127.0.0.1:${port}; DIRECT";
+  return "DIRECT";
+}
+`;
+    }
+    return `function FindProxyForURL(url, host) {
+${local}
+  return "${proxy}";
 }
 `;
   }
@@ -131,9 +157,11 @@ class SystemProxy {
     if (this.pacServer) { try { this.pacServer.close(); } catch {} this.pacServer = null; }
   }
 
-  async apply(port) {
+  async apply(port, mode = 'all', list = []) {
     if (this.applied) return;
     this.socksPort = port;
+    this.mode = mode === 'listed' ? 'listed' : 'all';
+    this.list = Array.isArray(list) ? list : [];
     await this.startPacServer(port);
     try {
       if (this.platform === 'win32') this._applyWindows(port);
@@ -344,7 +372,9 @@ ${argsXml}
       if (snap.mode === 'perapp') return false;
       return (snap.services || []).some((s) => {
         const cur = SystemProxy._macReadSync(s.name);
-        return cur.enabled && cur.server === '127.0.0.1' && cur.port === port;
+        if (cur.enabled && cur.server === '127.0.0.1' && cur.port === port) return true;
+        const auto = SystemProxy._macReadAutoSync(s.name);
+        return auto.enabled && OUR_PAC.test(auto.url);
       });
     }
     const g = this.snapshot && this.snapshot.gnome;
@@ -352,7 +382,9 @@ ${argsXml}
     const host = runSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'host']).trim();
     const gport = runSync('gsettings', ['get', 'org.gnome.system.proxy.socks', 'port']).trim();
     const mode = runSync('gsettings', ['get', 'org.gnome.system.proxy', 'mode']).trim();
-    return host === "'127.0.0.1'" && gport === port && mode === "'manual'";
+    if (host === "'127.0.0.1'" && gport === port && mode === "'manual'") return true;
+    const autourl = runSync('gsettings', ['get', 'org.gnome.system.proxy', 'autoconfig-url']).trim().replace(/^'(.*)'$/, '$1');
+    return mode === "'auto'" && OUR_PAC.test(autourl);
   }
 
   // ── Windows (WinINET, HKCU, no admin) ──────────────────────────────────
@@ -360,13 +392,17 @@ ${argsXml}
     const snap = {};
     for (const name of WIN_VALUES) snap[name] = regGet(name);
     this.snapshot = snap;
+    this.snapshot.appliedMode = this.mode;
     this._arm();
-    // Point WinINET at our HTTP-served PAC (file:// PACs are rejected by WinINET),
-    // plus a direct SOCKS proxy as a fallback for stacks that ignore PAC.
+    // WinINET loads the PAC over HTTP (file:// PACs are rejected). In 'listed'
+    // mode only the PAC decides, so we leave the user's manual proxy untouched;
+    // in 'all' mode we also set a direct SOCKS proxy for stacks that ignore PAC.
     regSet('AutoConfigURL', 'REG_SZ', this.pacUrl);
-    regSet('ProxyServer', 'REG_SZ', `socks=127.0.0.1:${port}`);
-    regSet('ProxyOverride', 'REG_SZ', '<local>;127.*;10.*;172.16.*;192.168.*;localhost');
-    regSet('ProxyEnable', 'REG_DWORD', '1');
+    if (this.mode === 'all') {
+      regSet('ProxyServer', 'REG_SZ', `socks=127.0.0.1:${port}`);
+      regSet('ProxyOverride', 'REG_SZ', '<local>;127.*;10.*;172.16.*;192.168.*;localhost');
+      regSet('ProxyEnable', 'REG_DWORD', '1');
+    }
     this._refreshWinInet();
   }
 
@@ -421,6 +457,16 @@ $t = Add-Type -MemberDefinition $sig -Name WinINet -Namespace Net -PassThru
     } catch { return { enabled: false, server: '', port: '' }; }
   }
 
+  static _macReadAutoSync(svc) {
+    try {
+      const info = runSync('networksetup', ['-getautoproxyurl', svc]);
+      return {
+        enabled: /Enabled:\s*Yes/i.test(info),
+        url: ((info.match(/^URL:\s*(.*)$/mi) || [])[1] || '').trim(),
+      };
+    } catch { return { enabled: false, url: '' }; }
+  }
+
   // Can we run networksetup without an interactive password prompt?
   async _macSudoNonInteractive() {
     try { await run('sudo', ['-n', 'networksetup', '-version'], 3000); return true; }
@@ -432,7 +478,15 @@ $t = Add-Type -MemberDefinition $sig -Name WinINet -Namespace Net -PassThru
     // user's account already allows it / managed Macs), then non-interactive
     // sudo, and finally fall back to per-app mode so we never hang on a prompt.
     const services = await this._macServices();
-    this.snapshot = { services: services.map((name) => ({ name, prev: SystemProxy._macReadSync(name) })), mode: 'system' };
+    this.snapshot = {
+      services: services.map((name) => ({
+        name,
+        prev: SystemProxy._macReadSync(name),
+        prevAuto: SystemProxy._macReadAutoSync(name),
+      })),
+      mode: 'system',
+      appliedMode: this.mode,
+    };
     this._arm();
     let anyOk = false;
     const sudoOk = await this._macSudoNonInteractive();
@@ -440,10 +494,19 @@ $t = Add-Type -MemberDefinition $sig -Name WinINet -Namespace Net -PassThru
 
     for (const svc of services) {
       try {
-        const [c1, ...a1] = prefix(['-setsocksfirewallproxy', svc, '127.0.0.1', String(port)]);
-        await run(c1, a1, 6000);
-        const [c2, ...a2] = prefix(['-setsocksfirewallproxystate', svc, 'on']);
-        await run(c2, a2, 6000);
+        if (this.mode === 'listed') {
+          // Only listed sites: drive routing with a PAC (setautoproxyurl),
+          // leaving the system SOCKS proxy untouched.
+          const [c1, ...a1] = prefix(['-setautoproxyurl', svc, this.pacUrl]);
+          await run(c1, a1, 6000);
+          const [c2, ...a2] = prefix(['-setautoproxystate', svc, 'on']);
+          await run(c2, a2, 6000);
+        } else {
+          const [c1, ...a1] = prefix(['-setsocksfirewallproxy', svc, '127.0.0.1', String(port)]);
+          await run(c1, a1, 6000);
+          const [c2, ...a2] = prefix(['-setsocksfirewallproxystate', svc, 'on']);
+          await run(c2, a2, 6000);
+        }
         anyOk = true;
       } catch (e) { /* keep trying other services */ }
     }
@@ -462,8 +525,10 @@ $t = Add-Type -MemberDefinition $sig -Name WinINet -Namespace Net -PassThru
 
   static _macRestoreArgs(s) {
     const steps = [];
-    if (s.prev.server && s.prev.port) steps.push(['-setsocksfirewallproxy', s.name, s.prev.server, s.prev.port]);
-    steps.push(['-setsocksfirewallproxystate', s.name, s.prev.enabled ? 'on' : 'off']);
+    if (s.prev && s.prev.server && s.prev.port) steps.push(['-setsocksfirewallproxy', s.name, s.prev.server, s.prev.port]);
+    if (s.prev) steps.push(['-setsocksfirewallproxystate', s.name, s.prev.enabled ? 'on' : 'off']);
+    if (s.prevAuto && s.prevAuto.url) steps.push(['-setautoproxyurl', s.name, s.prevAuto.url]);
+    if (s.prevAuto) steps.push(['-setautoproxystate', s.name, s.prevAuto.enabled ? 'on' : 'off']);
     return steps;
   }
 
@@ -499,12 +564,20 @@ $t = Add-Type -MemberDefinition $sig -Name WinINet -Namespace Net -PassThru
         const mode = (await run('gsettings', ['get', 'org.gnome.system.proxy', 'mode'])).trim();
         const host = (await run('gsettings', ['get', 'org.gnome.system.proxy.socks', 'host'])).trim();
         const sport = (await run('gsettings', ['get', 'org.gnome.system.proxy.socks', 'port'])).trim();
-        this.snapshot = { gnome: { mode, host, port: sport }, mode: 'gnome' };
+        const autourl = (await run('gsettings', ['get', 'org.gnome.system.proxy', 'autoconfig-url'])).trim();
+        this.snapshot = { gnome: { mode, host, port: sport, autourl }, mode: 'gnome', appliedMode: this.mode };
         this._arm();
-        await run('gsettings', ['set', 'org.gnome.system.proxy.socks', 'host', '127.0.0.1']);
-        await run('gsettings', ['set', 'org.gnome.system.proxy.socks', 'port', String(port)]);
-        await run('gsettings', ['set', 'org.gnome.system.proxy', 'mode', 'manual']);
-        this.log('info', 'GNOME system proxy set to SOCKS 127.0.0.1');
+        if (this.mode === 'listed') {
+          // Only listed sites: GNOME 'auto' mode with our PAC URL.
+          await run('gsettings', ['set', 'org.gnome.system.proxy', 'autoconfig-url', this.pacUrl]);
+          await run('gsettings', ['set', 'org.gnome.system.proxy', 'mode', 'auto']);
+          this.log('info', 'GNOME system proxy set to PAC (listed sites)');
+        } else {
+          await run('gsettings', ['set', 'org.gnome.system.proxy.socks', 'host', '127.0.0.1']);
+          await run('gsettings', ['set', 'org.gnome.system.proxy.socks', 'port', String(port)]);
+          await run('gsettings', ['set', 'org.gnome.system.proxy', 'mode', 'manual']);
+          this.log('info', 'GNOME system proxy set to SOCKS 127.0.0.1');
+        }
         return;
       } catch (e) {
         this.log('warning', `gsettings failed: ${e.message}`);
@@ -518,11 +591,13 @@ $t = Add-Type -MemberDefinition $sig -Name WinINet -Namespace Net -PassThru
   /* gsettings prints strings quoted ('none'); `set` takes them unquoted. */
   static _gnomeRestoreArgs(g) {
     const unq = (v) => String(v || '').replace(/^'(.*)'$/, '$1');
-    return [
-      ['set', 'org.gnome.system.proxy', 'mode', unq(g.mode) || 'none'],
+    const steps = [
       ['set', 'org.gnome.system.proxy.socks', 'host', unq(g.host)],
       ['set', 'org.gnome.system.proxy.socks', 'port', String(parseInt(g.port, 10) || 0)],
+      ['set', 'org.gnome.system.proxy', 'autoconfig-url', unq(g.autourl) || ''],
+      ['set', 'org.gnome.system.proxy', 'mode', unq(g.mode) || 'none'], // mode last
     ];
+    return steps;
   }
 
   async _restoreLinux() {

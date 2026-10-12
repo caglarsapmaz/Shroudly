@@ -3,7 +3,7 @@
 import { useEffect, useId, useRef, useState } from 'react';
 import { useLanguage } from '../contexts/LanguageContext';
 import {
-  AlertTriangleIcon, CheckCircleIcon, InfoIcon, LanguagesIcon, SearchIcon, ShieldAlertIcon,
+  AlertTriangleIcon, CheckCircleIcon, GlobeIcon, InfoIcon, LanguagesIcon, SearchIcon, ShieldAlertIcon,
   SpinnerIcon, XCircleIcon, ZapIcon,
 } from './icons';
 import Select from './Select';
@@ -140,11 +140,18 @@ export default function SettingsPanel({ active = false }) {
   const testingRef = useRef(null);
   const timeoutRef = useRef(null);
   const [settings, setSettings] = useState({
-    strategyId: 'auto', autoMode: true, dnsProtection: true, preferIpv6: false,
+    strategyId: 'auto', autoMode: true, dnsProtection: true, preferIpv6: false, routeMode: 'listed',
     autoStart: false, minimizeToTray: true, showNotifications: true,
   });
   // null while unknown; false greys out "Prefer IPv6" on IPv4-only networks
   const [ipv6Ok, setIpv6Ok] = useState(null);
+  const [defaultList, setDefaultList] = useState([]);
+  const [siteText, setSiteText] = useState(null); // textarea draft (null until loaded)
+
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electron?.defaultSiteList) return;
+    window.electron.defaultSiteList().then((l) => Array.isArray(l) && setDefaultList(l)).catch(() => {});
+  }, []);
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electron?.ipv6Available) return;
@@ -154,7 +161,11 @@ export default function SettingsPanel({ active = false }) {
   useEffect(() => {
     (async () => {
       if (typeof window === 'undefined' || !window.electron?.getAllSettings) return;
-      try { const all = await window.electron.getAllSettings(); setSettings((p) => ({ ...p, ...all })); } catch {}
+      try {
+        const all = await window.electron.getAllSettings();
+        setSettings((p) => ({ ...p, ...all }));
+        if (Array.isArray(all.siteList)) setSiteText(all.siteList.join('\n'));
+      } catch {}
     })();
   }, []);
 
@@ -300,6 +311,55 @@ export default function SettingsPanel({ active = false }) {
           <p className="mt-2 flex items-start gap-2 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>
             <InfoIcon className="mt-[1px] h-3.5 w-3.5" />
             <span className="min-w-0">{t('restartToApply')}</span>
+          </p>
+        )}
+      </Section>
+
+      {/* Routing: which sites go through Shroudly */}
+      <Section title={t('routing')} Icon={GlobeIcon}>
+        <Select
+          value={settings.routeMode === 'all' ? 'all' : 'listed'}
+          options={[
+            { value: 'listed', label: t('routeListed') },
+            { value: 'all', label: t('routeAll') },
+          ]}
+          onChange={(v) => save('routeMode', v)}
+        />
+        <p className="mt-2 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>
+          {settings.routeMode === 'all' ? t('routeAllDesc') : t('routeListedDesc')}
+        </p>
+
+        {settings.routeMode !== 'all' && (
+          <div className="mt-3">
+            <div className="mb-1.5 flex items-center justify-between gap-2">
+              <span className="text-[12px] font-medium" style={{ color: 'var(--text-faint)' }}>{t('siteListLabel')}</span>
+              <button type="button"
+                      onClick={() => { const l = defaultList.slice(); setSiteText(l.join('\n')); save('siteList', l); }}
+                      className="text-[12px] underline" style={{ color: 'var(--text-dim)' }}>
+                {t('resetToDefault')}
+              </button>
+            </div>
+            <textarea
+              value={siteText == null ? (settings.siteList || defaultList).join('\n') : siteText}
+              onChange={(e) => setSiteText(e.target.value)}
+              onBlur={() => {
+                const list = (siteText || '')
+                  .split(/[\s,]+/).map((d) => d.trim().toLowerCase()).filter(Boolean);
+                save('siteList', list);
+              }}
+              spellCheck={false} rows={6} dir="ltr"
+              placeholder={'discord.com\nroblox.com'}
+              className="mono w-full resize-y rounded-[var(--radius-sm)] p-2.5 text-[12.5px] leading-relaxed outline-none"
+              style={{ background: 'var(--surface-2)', border: '1px solid var(--line)', color: 'var(--text)' }}
+            />
+            <p className="mt-1.5 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>{t('siteListHint')}</p>
+          </div>
+        )}
+
+        {active && (
+          <p className="mt-2 flex items-start gap-2 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>
+            <InfoIcon className="mt-[1px] h-3.5 w-3.5" />
+            <span className="min-w-0">{t('routeAppliesNow')}</span>
           </p>
         )}
       </Section>

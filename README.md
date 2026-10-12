@@ -132,6 +132,7 @@ model and test results.
 - **Never breaks your connection** — your proxy settings are saved before Shroudly changes them and put back on stop, crash, forced kill, shutdown, power loss (at next sign-in) and uninstall.
 - **Real auto-probe** — finds and learns a working strategy per host.
 - **Encrypted DNS (DoH)** — real DNS-over-HTTPS by default; defeats DNS-based blocking (the most common censorship layer in e.g. Turkey) and drops ISP block-page answers.
+- **Split routing** — by default only known-blocked sites go through Shroudly (editable list); everything else, including banking and government sites, connects directly. "All traffic" is also available.
 - **Honest live stats** — connections, bytes, TLS/HTTP seen and desyncs applied are real counters streamed from the engine, not estimates.
 - **Live user count** — Stats shows how many people are using Shroudly right now (see [Privacy](#privacy)).
 - **Automatic updates** — new releases from GitHub install themselves (Windows, macOS, Linux AppImage and .deb).

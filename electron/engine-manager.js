@@ -20,6 +20,17 @@ const SystemProxy = require('./system-proxy');
 const DohForwarder = require('./doh-forwarder');
 
 const DEFAULT_PORT = 10808;
+
+// Domains routed through the proxy in "listed" mode (default). Commonly blocked
+// in Turkey and similar; users can edit the list in Settings.
+const DEFAULT_SITE_LIST = [
+  'discord.com', 'discord.gg', 'discordapp.com', 'discordapp.net', 'discord.media',
+  'discordcdn.com', 'discord.dev', 'discordstatus.com',
+  'roblox.com', 'rbxcdn.com', 'roblox.cash',
+  'wattpad.com', 'pastebin.com',
+  'medium.com', 'imgur.com',
+  'soundcloud.com', 'onlyfans.com',
+];
 const MAX_RESTARTS = 5;
 // No output at all for this long, although STATS is asked every second, means
 // the engine hangs: the system proxy then points at a dead endpoint, so treat
@@ -92,6 +103,8 @@ class EngineManager {
       autoProbe: s.autoMode !== false,          // "auto mode" now means real auto-probe
       useDoh: s.dnsProtection !== false,        // encrypted DNS: default on
       preferIpv6: s.preferIpv6 === true,
+      routeMode: s.routeMode === 'all' ? 'all' : 'listed',   // default: listed sites only
+      siteList: Array.isArray(s.siteList) ? s.siteList : DEFAULT_SITE_LIST,
       port: Number(s.listenPort || this.port) || DEFAULT_PORT,
     };
   }
@@ -134,7 +147,7 @@ class EngineManager {
     }
 
     try {
-      await this.proxy.apply(this.port);
+      await this.proxy.apply(this.port, cfg.routeMode, cfg.siteList);
     } catch (e) {
       this.log('error', `Could not set system proxy: ${e.message}`);
       await this._cleanup();
@@ -345,6 +358,21 @@ class EngineManager {
     return { success: true };
   }
 
+  /* Re-apply the system proxy with the current route mode / site list, without
+   * restarting the engine. Used when the user changes those settings. */
+  async reapplyProxy() {
+    if (!this.active) return { success: true };
+    const cfg = this._settings();
+    try {
+      await this.proxy.restore();                       // back to the user's own settings
+      await this.proxy.apply(this.port, cfg.routeMode, cfg.siteList);
+      this.log('success', 'Proxy routing updated');
+    } catch (e) {
+      this.log('error', `Could not update proxy routing: ${e.message}`);
+    }
+    return { success: true };
+  }
+
   _waitExit(ms) {
     return new Promise((resolve) => {
       if (!this.proc) return resolve();
@@ -384,3 +412,4 @@ class EngineManager {
 
 module.exports = EngineManager;
 module.exports.coreBinaryPath = coreBinaryPath;
+module.exports.DEFAULT_SITE_LIST = DEFAULT_SITE_LIST;
