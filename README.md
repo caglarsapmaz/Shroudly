@@ -7,7 +7,7 @@
 
   [![Release](https://img.shields.io/github/v/release/umutxyp/Shroudly)](https://github.com/umutxyp/Shroudly/releases/latest)
   [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
-  [![Electron](https://img.shields.io/badge/Electron-33-47848F?logo=electron)](https://www.electronjs.org/)
+  [![Electron](https://img.shields.io/badge/Electron-43-47848F?logo=electron)](https://www.electronjs.org/)
   [![Next.js](https://img.shields.io/badge/Next.js-14-000000?logo=next.js)](https://nextjs.org/)
   [![Windows](https://img.shields.io/badge/Windows-0078D6?logo=windows)](#)
   [![macOS](https://img.shields.io/badge/macOS-000000?logo=apple)](#)
@@ -80,7 +80,7 @@ strategy**:
 | **Disorder** | Sends the later segment first; the server's TCP stack reorders it correctly, a stateless DPI cannot. |
 | **Mid-SNI / double split** | Extra split points inside and around the hostname for stubborn DPI. |
 | **HTTP Host scramble** | Rewrites `Host:` casing for plain HTTP. |
-| **Anti-poisoning DNS** | Resolves names against several independent public resolvers in parallel and drops spoofed / bogon answers, defeating DNS-based blocking without any encrypted-DNS dependency. |
+| **Encrypted DNS (DoH)** | Resolves names over real DNS-over-HTTPS (RFC 8484) to Cloudflare / Quad9 / Google, reached by IP with no SNI so the resolver traffic itself can't be blocked or injected. Known ISP block-page answers (e.g. Turk Telekom's) are dropped. Falls back to multi-resolver UDP if DoH is unreachable. On by default. |
 | **Auto-probe** | Tests strategies against a host with a real handshake and remembers the one that works — like `goodbyeDPI`/`zapret` blockcheck, built in. |
 
 > **Note on "fake packets".** Low-TTL decoy packets (as used by driver-based
@@ -131,7 +131,7 @@ model and test results.
 - **Optional Advanced mode** — packet-layer fake-packet desync for stateful DPI (Iran/China), opt-in and privileged.
 - **Never breaks your connection** — your proxy settings are saved before Shroudly changes them and put back on stop, crash, forced kill, shutdown, power loss (at next sign-in) and uninstall.
 - **Real auto-probe** — finds and learns a working strategy per host.
-- **Anti-poisoning resolver** — optional multi-resolver DNS that filters spoofed answers.
+- **Encrypted DNS (DoH)** — real DNS-over-HTTPS by default; defeats DNS-based blocking (the most common censorship layer in e.g. Turkey) and drops ISP block-page answers.
 - **Honest live stats** — connections, bytes, TLS/HTTP seen and desyncs applied are real counters streamed from the engine, not estimates.
 - **Live user count** — Stats shows how many people are using Shroudly right now (see [Privacy](#privacy)).
 - **Automatic updates** — new releases from GitHub install themselves (Windows, macOS, Linux AppImage and .deb).
@@ -214,7 +214,7 @@ Shroudly/
       proto.[ch]              TLS ClientHello + HTTP request parsing
       strategy.[ch]           desync strategy spec parser + presets
       desync.[ch]             applies a strategy to the first payload
-      doh.[ch]                anti-poisoning DNS resolver
+      doh.[ch]                DNS resolver (local DoH forwarder + UDP fallback)
       probe.[ch]              per-host auto-probe
       engine.[ch]             SOCKS5 listener + relay
       raw_linux.[ch]          Advanced mode: NFQUEUE backend
@@ -226,6 +226,7 @@ Shroudly/
     main.js                   app shell, tray, IPC, auto-start
     engine-manager.js         spawns shroudly-core, parses JSON, restarts
     system-proxy.js           set/restore OS proxy (Win/mac/Linux), crash-safe
+    doh-forwarder.js          local DNS-over-HTTPS forwarder (encrypted DNS)
     proxy-watchdog.js         restores the proxy if the app is killed
     updater.js                automatic updates from GitHub releases
     advanced-mode.js          Advanced mode: elevation (UAC / pkexec) + lifecycle

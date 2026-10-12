@@ -140,7 +140,7 @@ export default function SettingsPanel({ active = false }) {
   const testingRef = useRef(null);
   const timeoutRef = useRef(null);
   const [settings, setSettings] = useState({
-    strategyId: 'auto', autoMode: true, dnsProtection: false, preferIpv6: false,
+    strategyId: 'auto', autoMode: true, dnsProtection: true, preferIpv6: false,
     autoStart: false, minimizeToTray: true, showNotifications: true,
   });
   // null while unknown; false greys out "Prefer IPv6" on IPv4-only networks
@@ -288,7 +288,7 @@ export default function SettingsPanel({ active = false }) {
 
         <div className="divide-y" style={{ borderColor: 'var(--line)' }}>
           <Toggle label={t('autoMode')} desc={t('autoModeDesc')} checked={settings.autoMode} onChange={(v) => save('autoMode', v)} />
-          <Toggle label={t('dnsProtection')} desc={t('dnsProtectionDesc')} checked={settings.dnsProtection} onChange={(v) => save('dnsProtection', v)} />
+          <Toggle label={t('dnsProtection')} desc={t('dnsProtectionDesc')} checked={settings.dnsProtection !== false} onChange={(v) => save('dnsProtection', v)} />
           <Toggle label={t('preferIpv6')}
                   desc={ipv6Ok === false ? t('ipv6Unavailable') : t('preferIpv6Desc')}
                   checked={settings.preferIpv6}
@@ -344,8 +344,12 @@ export default function SettingsPanel({ active = false }) {
         {probeResult && (
           <div className="mt-3" aria-live="polite">
             {probeResult.ok && probeResult.strategy === 'none' && (
-              <Notice tone="info" Icon={InfoIcon}>
-                <p style={{ color: 'var(--text-dim)' }}>{t('probeNotBlocked', { host: probeResult.host })}</p>
+              <Notice tone={probeResult.dns_blocked ? 'ok' : 'info'} Icon={probeResult.dns_blocked ? CheckCircleIcon : InfoIcon}>
+                <p style={{ color: probeResult.dns_blocked ? 'var(--ok)' : 'var(--text-dim)' }}>
+                  {probeResult.dns_blocked
+                    ? t('probeDnsBlocked', { host: probeResult.host })
+                    : t('probeNotBlocked', { host: probeResult.host })}
+                </p>
               </Notice>
             )}
             {probeResult.ok && probeResult.strategy !== 'none' && (

@@ -92,12 +92,28 @@ static int test_strategy(const char *host, const strategy *st, int use_doh) {
   return ok;
 }
 
+/* Is this name censored at the DNS layer? The OS resolver (system DNS) is asked
+ * directly; if it answers with a known block-page / bogon address, the name is
+ * DNS-blocked here. Shroudly's own resolver (DoH forwarder) sidesteps this, so
+ * the site can still work while DNS is blocked. */
+static int dns_is_censored(const char *host) {
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET; hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo(host, "443", &hints, &res) != 0 || !res) { if (res) freeaddrinfo(res); return 0; }
+  struct sockaddr_storage sa; memset(&sa, 0, sizeof(sa));
+  memcpy(&sa, res->ai_addr, res->ai_addrlen);
+  freeaddrinfo(res);
+  return doh_addr_is_block(&sa);
+}
+
 int probe_host(const char *host, const engine_config *cfg) {
+  const char *dnsb = dns_is_censored(host) ? "true" : "false";
   /* 1. Baseline: does a plain handshake already work? Then the host isn't
    *    blocked here and no desync is needed. */
   if (test_strategy(host, NULL, cfg->use_doh)) {
     printf("{\"type\":\"probe\",\"host\":\"%s\",\"ok\":true,\"strategy\":\"none\","
-           "\"blocked\":false}\n", host);
+           "\"blocked\":false,\"dns_blocked\":%s}\n", host, dnsb);
     fflush(stdout);
     return -2; /* -2 = not blocked, relay as-is */
   }
@@ -108,7 +124,7 @@ int probe_host(const char *host, const engine_config *cfg) {
     const strategy *st = strategy_preset(i);
     if (test_strategy(host, st, cfg->use_doh)) {
       printf("{\"type\":\"probe\",\"host\":\"%s\",\"strategy\":\"%s\",\"ok\":true,"
-             "\"blocked\":true}\n", host, st->name);
+             "\"blocked\":true,\"dns_blocked\":%s}\n", host, st->name, dnsb);
       fflush(stdout);
       engine_learn(host, i);
       return i;
@@ -119,7 +135,7 @@ int probe_host(const char *host, const engine_config *cfg) {
    *    split/disorder cannot defeat (likely stateful reassembly, e.g. Iran/China).
    *    Signal the UI to offer Advanced (packet-layer) mode. */
   printf("{\"type\":\"probe\",\"host\":\"%s\",\"ok\":false,\"blocked\":true,"
-         "\"suggest\":\"advanced\"}\n", host);
+         "\"suggest\":\"advanced\",\"dns_blocked\":%s}\n", host, dnsb);
   fflush(stdout);
   return -1;
 }

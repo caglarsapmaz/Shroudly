@@ -1,9 +1,15 @@
 /*
  * Resolver with anti-poisoning.
  *
- * A full DoH/DoT client needs a TLS stack, which we deliberately avoid to keep
- * the engine dependency-free and identical on every OS. Instead we defeat DNS
- * poisoning without encryption:
+ * Primary path (when the app passes --doh-port): a local DNS-over-HTTPS
+ * forwarder (electron/doh-forwarder.js) that this engine queries over UDP on
+ * 127.0.0.1. The forwarder speaks real RFC 8484 DoH to Cloudflare/Google/Quad9
+ * over TLS, connecting by IP with no SNI, so the resolver traffic itself cannot
+ * be blocked by SNI and cannot be read or injected on the wire.
+ *
+ * Fallback (forwarder down, or no --doh-port): several independent public
+ * resolvers over UDP/53, cross-checked. Not encrypted, but driver-free and
+ * still defeats the most common layer (UDP/53 reply injection):
  *
  *   1. Query several independent public resolvers in parallel over UDP/53.
  *   2. Poisoned answers from on-path injectors arrive first and usually point to
@@ -103,6 +109,45 @@ static int is_bogon_v4(uint32_t ip /*host order*/) {
   return 0;
 }
 
+/* Known ISP block-page / sinkhole addresses (host order). DNS-based censorship
+ * answers blocked names with one of these instead of a bogon, so they must be
+ * rejected like bogons. Seeded with Turk Telekom's; the app can add more at
+ * runtime with --block-ip, no recompile needed. */
+#define MAX_BLOCK_IPS 32
+static uint32_t g_block_ips[MAX_BLOCK_IPS] = {
+  0xC3AFFE02u, /* 195.175.254.2  — TTNET block page */
+};
+static int g_block_n = 1;
+
+void doh_add_block_ip(const char *ip) {
+  struct in_addr a;
+  if (inet_pton(AF_INET, ip, &a) != 1) return;
+  uint32_t h = ntohl(a.s_addr);
+  for (int i = 0; i < g_block_n; i++) if (g_block_ips[i] == h) return;
+  if (g_block_n < MAX_BLOCK_IPS) g_block_ips[g_block_n++] = h;
+}
+
+static int is_blockpage_v4(uint32_t ip /*host order*/) {
+  for (int i = 0; i < g_block_n; i++) if (g_block_ips[i] == ip) return 1;
+  return 0;
+}
+
+/* True if a resolved address is a censorship answer (block page or bogon). */
+int doh_addr_is_block(const struct sockaddr_storage *sa) {
+  if (sa->ss_family != AF_INET) return 0;
+  uint32_t ip = ntohl(((const struct sockaddr_in *)sa)->sin_addr.s_addr);
+  return is_bogon_v4(ip) || is_blockpage_v4(ip);
+}
+
+/* Optional local DoH forwarder (127.0.0.1:port), tried before public UDP. */
+static char     g_fwd_ip[64] = "";
+static uint16_t g_fwd_port = 0;
+void doh_set_local(const char *ip, int port) {
+  if (!ip || port <= 0 || port > 65535) { g_fwd_ip[0] = 0; g_fwd_port = 0; return; }
+  strncpy(g_fwd_ip, ip, sizeof(g_fwd_ip) - 1); g_fwd_ip[sizeof(g_fwd_ip) - 1] = 0;
+  g_fwd_port = (uint16_t)port;
+}
+
 /* ── DNS wire format ────────────────────────────────────────────────────── */
 static int dns_build(uint8_t *q, const char *name, uint16_t id, int type) {
   int p = 0;
@@ -156,7 +201,7 @@ static int dns_parse(const uint8_t *r, int len, int want6,
       if (!want6 && rdlen == 4) {
         uint32_t ip = ((uint32_t)r[rdata] << 24) | ((uint32_t)r[rdata+1] << 16) |
                       ((uint32_t)r[rdata+2] << 8) | (uint32_t)r[rdata+3];
-        if (is_bogon_v4(ip)) { p = rdata + rdlen; continue; }
+        if (is_bogon_v4(ip) || is_blockpage_v4(ip)) { p = rdata + rdlen; continue; }
         struct sockaddr_in *s = (struct sockaddr_in *)out;
         memset(s, 0, sizeof(*s));
         s->sin_family = AF_INET;
@@ -182,16 +227,17 @@ static int dns_parse(const uint8_t *r, int len, int want6,
 
 /* Query one resolver over UDP; collect up to 3 replies within the window and
  * return the first non-bogon answer. */
-static int query_udp(const char *resolver, const char *name, int want6, uint16_t port,
-                     struct sockaddr_storage *out, socklen_t *outlen) {
+static int query_udp_at(const char *resolver, uint16_t rport, int timeout_ms,
+                        const char *name, int want6, uint16_t port,
+                        struct sockaddr_storage *out, socklen_t *outlen) {
   sock_t s = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
   if (s == SOCK_INVALID) return -1;
-  sock_set_timeouts(s, 1500);
+  sock_set_timeouts(s, timeout_ms);
 
   struct sockaddr_in to;
   memset(&to, 0, sizeof(to));
   to.sin_family = AF_INET;
-  to.sin_port = htons(53);
+  to.sin_port = htons(rport);
   if (inet_pton(AF_INET, resolver, &to.sin_addr) != 1) { sock_close(s); return -1; }
 
   uint8_t q[512];
@@ -202,7 +248,7 @@ static int query_udp(const char *resolver, const char *name, int want6, uint16_t
     sock_close(s); return -1;
   }
 
-  uint64_t deadline = now_ms() + 1500;
+  uint64_t deadline = now_ms() + timeout_ms;
   int rc = -1;
   while (now_ms() < deadline) {
     int w = sock_wait_readable(s, (int)(deadline - now_ms()));
@@ -249,12 +295,24 @@ int doh_resolve(const char *name, uint16_t port, int want6,
   if (c) { memcpy(out, &c->sa, sizeof(*out)); *outlen = c->salen; mutex_unlock(&g_cache_mx); return 0; }
   mutex_unlock(&g_cache_mx);
 
-  /* Query resolvers; accept the first clean answer. Trying several independent
-   * resolvers means an on-path injector must poison all of them identically. */
+  /* 1. Real encrypted DNS via the local forwarder, if the app started one. */
+  if (g_fwd_port) {
+    struct sockaddr_storage cand; socklen_t cl;
+    if (query_udp_at(g_fwd_ip, g_fwd_port, 4000, name, want6, port, &cand, &cl) == 0) {
+      mutex_lock(&g_cache_mx);
+      cache_put(name, port, want6 ? AF_INET6 : AF_INET, &cand, cl);
+      mutex_unlock(&g_cache_mx);
+      memcpy(out, &cand, sizeof(cand)); *outlen = cl;
+      return 0;
+    }
+  }
+
+  /* 2. Fallback: several independent public resolvers over UDP/53. An on-path
+   * injector must poison all of them identically to win. */
   int nodata = 0;
   for (int i = 0; i < MAX_RESOLVERS; i++) {
     struct sockaddr_storage cand; socklen_t cl;
-    int qr = query_udp(RESOLVERS[i], name, want6, port, &cand, &cl);
+    int qr = query_udp_at(RESOLVERS[i], 53, 1500, name, want6, port, &cand, &cl);
     if (qr == 0) {
       mutex_lock(&g_cache_mx);
       cache_put(name, port, want6 ? AF_INET6 : AF_INET, &cand, cl);
@@ -274,10 +332,17 @@ int doh_resolve(const char *name, uint16_t port, int want6,
   hints.ai_socktype = SOCK_STREAM;
   char portstr[8]; snprintf(portstr, sizeof(portstr), "%u", port);
   if (getaddrinfo(name, portstr, &hints, &res) == 0 && res) {
-    memcpy(out, res->ai_addr, res->ai_addrlen);
-    *outlen = (socklen_t)res->ai_addrlen;
+    for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
+      struct sockaddr_storage cand; memset(&cand, 0, sizeof(cand));
+      memcpy(&cand, ai->ai_addr, ai->ai_addrlen);
+      if (doh_addr_is_block(&cand)) continue;  /* OS DNS was poisoned too */
+      memcpy(out, ai->ai_addr, ai->ai_addrlen);
+      *outlen = (socklen_t)ai->ai_addrlen;
+      freeaddrinfo(res);
+      return 0;
+    }
     freeaddrinfo(res);
-    return 0;
+    return -1;
   }
   if (res) freeaddrinfo(res);
   return -1;

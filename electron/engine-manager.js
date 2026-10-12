@@ -17,6 +17,7 @@ const { spawn } = require('child_process');
 const path = require('path');
 const fs = require('fs');
 const SystemProxy = require('./system-proxy');
+const DohForwarder = require('./doh-forwarder');
 
 const DEFAULT_PORT = 10808;
 const MAX_RESTARTS = 5;
@@ -51,6 +52,8 @@ class EngineManager {
     this.lastProbe = null;
     this.proxyOptions = hooks.proxyOptions || {};
     this.proxy = new SystemProxy(this.log, this.proxyOptions);
+    this.doh = new DohForwarder(this.log);
+    this.dohPort = 0;
 
     this.proc = null;
     this.active = false;
@@ -87,7 +90,7 @@ class EngineManager {
     return {
       strategy,
       autoProbe: s.autoMode !== false,          // "auto mode" now means real auto-probe
-      useDoh: s.dnsProtection === true,         // anti-poisoning resolver
+      useDoh: s.dnsProtection !== false,        // encrypted DNS: default on
       preferIpv6: s.preferIpv6 === true,
       port: Number(s.listenPort || this.port) || DEFAULT_PORT,
     };
@@ -96,7 +99,7 @@ class EngineManager {
   _args(cfg) {
     const a = ['--listen', '127.0.0.1', '--port', String(cfg.port), '--strategy', cfg.strategy];
     if (cfg.autoProbe) a.push('--auto');
-    if (cfg.useDoh) a.push('--doh');
+    if (cfg.useDoh) { a.push('--doh'); if (this.dohPort) a.push('--doh-port', String(this.dohPort)); }
     if (cfg.preferIpv6) a.push('--ipv6');
     return a;
   }
@@ -116,6 +119,13 @@ class EngineManager {
     this.stats = this._empty();
     this.stats.strategy = cfg.strategy;
     this.expectingStop = false;
+
+    // Start the local DoH forwarder so the engine gets real encrypted DNS.
+    // If it can't start, the engine falls back to public UDP resolvers.
+    if (cfg.useDoh && !this.dohPort) {
+      try { this.dohPort = await this.doh.start(); }
+      catch (e) { this.dohPort = 0; this.log('warning', `Encrypted DNS unavailable: ${e.message}`); }
+    }
 
     const ready = await this._spawn(bin, this._args(cfg));
     if (!ready) {
@@ -291,6 +301,11 @@ class EngineManager {
       this.proc = null;
       this.expectingStop = false;
       this.stats.strategy = cfg.strategy;
+      // DNS protection may have just been turned on: start the forwarder;
+      // or turned off: it keeps running harmlessly and is dropped on stop().
+      if (cfg.useDoh && !this.dohPort) {
+        try { this.dohPort = await this.doh.start(); } catch { this.dohPort = 0; }
+      }
       const ready = await this._spawn(coreBinaryPath(), this._args(cfg));
       if (!ready) {
         await this._cleanup(); // restores the proxy
@@ -323,6 +338,7 @@ class EngineManager {
     this.active = false;
     this.restarts = 0;
     this.startedAt = 0;
+    this.doh.stop(); this.dohPort = 0;
     this.store.set('runtimeActive', false);
     this.onStatusChange(false);
     this.log('success', 'Shroudly engine stopped; system restored');
@@ -340,6 +356,7 @@ class EngineManager {
   async _cleanup() {
     this._stopStatsPoll();
     if (this.proc) { try { this.proc.kill(); } catch {} this.proc = null; }
+    this.doh.stop(); this.dohPort = 0;
     try { await this.proxy.restore(); } catch {}
     this.active = false;
   }
@@ -347,6 +364,7 @@ class EngineManager {
   // Synchronous last-resort cleanup on hard exit.
   cleanupSync() {
     try { if (this.proc) this.proc.kill(); } catch {}
+    try { this.doh.stop(); } catch {}
     try { this.proxy.restoreSync(); } catch {}
   }
 

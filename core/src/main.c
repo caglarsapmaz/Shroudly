@@ -16,6 +16,7 @@
 #include "probe.h"
 #include "platform.h"
 #include "strategy.h"
+#include "doh.h"
 #if defined(SHROUDLY_RAW) && defined(__linux__)
 #include "raw_linux.h"
 #endif
@@ -34,6 +35,8 @@
 #endif
 
 static engine_config g_cfg;
+static char g_doh_fwd_ip[64] = "127.0.0.1";
+static int  g_doh_fwd_port = 0;
 static int g_advanced = 0;
 static int g_queue = 200;
 static int g_fake_ttl = 4;
@@ -72,6 +75,9 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--auto")) g_cfg.auto_probe = 1;
     else if (!strcmp(argv[i], "--doh")) g_cfg.use_doh = 1;
     else if (!strcmp(argv[i], "--ipv6")) g_cfg.prefer_ipv6 = 1;
+    else if (!strcmp(argv[i], "--doh-ip") && i+1<argc) strncpy(g_doh_fwd_ip, argv[++i], sizeof(g_doh_fwd_ip)-1);
+    else if (!strcmp(argv[i], "--doh-port") && i+1<argc) g_doh_fwd_port = atoi(argv[++i]);
+    else if (!strcmp(argv[i], "--block-ip") && i+1<argc) doh_add_block_ip(argv[++i]);
     else if (!strcmp(argv[i], "--advanced")) g_advanced = 1;
     else if (!strcmp(argv[i], "--queue") && i+1<argc) g_queue = atoi(argv[++i]);
     else if (!strcmp(argv[i], "--fake-ttl") && i+1<argc) g_fake_ttl = atoi(argv[++i]);
@@ -79,6 +85,8 @@ int main(int argc, char **argv) {
     else if (!strcmp(argv[i], "--parent-pid") && i+1<argc) g_parent_pid = atol(argv[++i]);
     else if (!strcmp(argv[i], "--help")) { usage(); return 0; }
   }
+
+  if (g_cfg.use_doh && g_doh_fwd_port > 0) doh_set_local(g_doh_fwd_ip, g_doh_fwd_port);
 
 #if defined(SHROUDLY_RAW)
   /* Advanced (packet-layer) mode: run the per-OS fake-packet backend instead of
