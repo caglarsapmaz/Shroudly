@@ -6,7 +6,7 @@
   "private": true,
   "author": {
     "name": "Codeshare Technology Ltd",
-    "email": "support@codeshare.me"
+    "email": "contact@codeshare.me"
   },
   "homepage": "https://codeshare.me",
   "repository": {
@@ -154,7 +154,7 @@
           ]
         }
       ],
-      "maintainer": "Codeshare Technology Ltd <support@codeshare.me>",
+      "maintainer": "Codeshare Technology Ltd <contact@codeshare.me>",
       "files": [
         "electron/tools/core/linux-${arch}/**"
       ],
