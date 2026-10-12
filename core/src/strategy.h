@@ -35,7 +35,7 @@ typedef struct {
 
 #define MAX_OPS 8
 
-typedef enum { FAKE_TTL = 0, FAKE_BADSUM = 1, FAKE_TTL_BADSEQ = 2 } fake_mode;
+typedef enum { FAKE_TTL = 0, FAKE_BADSUM = 1, FAKE_TTL_BADSEQ = 2, FAKE_MD5 = 3 } fake_mode;
 
 typedef struct {
   char      name[32];

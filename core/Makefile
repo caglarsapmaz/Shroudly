@@ -23,7 +23,7 @@ test: test/test_proto.c test/test_desync.c $(SRC)
 	$(CC) -std=c11 -O2 -Wall -o /tmp/shroudly_test_proto src/proto.c src/strategy.c test/test_proto.c
 	/tmp/shroudly_test_proto
 	$(CC) -std=c11 -O2 -Wall -pthread -o /tmp/shroudly_test_desync \
-		src/platform.c src/proto.c src/strategy.c src/desync.c src/doh.c test/test_desync.c $(LDLIBS)
+		src/platform.c src/proto.c src/strategy.c src/desync.c src/fake.c src/doh.c test/test_desync.c $(LDLIBS)
 	/tmp/shroudly_test_desync
 
 # Sanitizer build of the full test set (memory + UB checks).

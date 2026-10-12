@@ -99,6 +99,19 @@ class SystemProxy {
   /* A PAC that always sends local/private hosts direct. In 'all' mode every
    * other host goes through the proxy; in 'listed' mode only the domains in
    * this.list (and their subdomains) do, everything else goes direct. */
+  /* A plain hostname: ASCII letters, digits, hyphens and dots, at least two
+   * labels, each label 1-63 characters, 253 overall. Deliberately strict —
+   * this is the same rule the settings screen shows the user, so what they see
+   * accepted is exactly what ends up routing their traffic. */
+  static isHostname(d) {
+    if (typeof d !== 'string' || d.length < 3 || d.length > 253) return false;
+    if (!/^[a-z0-9.-]+$/.test(d)) return false;
+    if (d.startsWith('.') || d.endsWith('.') || d.includes('..')) return false;
+    const labels = d.split('.');
+    if (labels.length < 2) return false;
+    return labels.every((l) => l.length >= 1 && l.length <= 63 && !l.startsWith('-') && !l.endsWith('-'));
+  }
+
   pacBody(port) {
     const proxy = `SOCKS5 127.0.0.1:${port}; SOCKS 127.0.0.1:${port}; DIRECT`;
     const local = `  if (isPlainHostName(host) ||
@@ -109,9 +122,13 @@ class SystemProxy {
   }`;
     if (this.mode === 'listed') {
       // Clean the list to bare domains, dedupe, and embed as a JS array.
+      // Anything that is not a plain hostname is dropped rather than embedded:
+      // this file decides the route for EVERY request the browser makes, so an
+      // entry that broke its syntax would not merely be ignored — it would stop
+      // the browser resolving a proxy at all, and all browsing with it.
       const domains = [...new Set((this.list || [])
         .map((d) => String(d).trim().toLowerCase().replace(/^\*?\.?/, '').replace(/\/.*$/, ''))
-        .filter(Boolean))];
+        .filter((d) => SystemProxy.isHostname(d)))];
       return `var SHROUDLY_LIST = ${JSON.stringify(domains)};
 function FindProxyForURL(url, host) {
 ${local}

@@ -230,7 +230,12 @@ class DohForwarder {
   start() {
     return new Promise((resolve, reject) => {
       const sock = dgram.createSocket('udp4');
-      sock.on('error', (e) => { this.log('warning', `DoH forwarder: ${e.message}`); try { sock.close(); } catch {} });
+      // A transient send error (an unreachable loopback reply, a full buffer)
+      // must not take the forwarder down: the engine would keep sending to a
+      // dead port and every lookup would quietly fall back to the plain DNS
+      // this exists to avoid. Only a failure to bind is fatal, and that is
+      // handled by the once('error') below, before the port is published.
+      sock.on('error', (e) => { this.log('warning', `DoH forwarder: ${e.message}`); });
       sock.on('message', (msg, rinfo) => {
         if (msg.length < 12 || msg.length > 4096) return; // not a sane DNS query
         const key = questionKey(msg);

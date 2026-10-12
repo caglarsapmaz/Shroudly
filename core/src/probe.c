@@ -1,4 +1,7 @@
 #include "probe.h"
+
+/* Comfortably inside the app's engine-liveness window. */
+#define PROBE_BUDGET_MS 25000
 #include "platform.h"
 #include "proto.h"
 #include "desync.h"
@@ -118,9 +121,22 @@ int probe_host(const char *host, const engine_config *cfg) {
     return -2; /* -2 = not blocked, relay as-is */
   }
 
-  /* 2. Try each userspace strategy (split/disorder). */
+  /* 2. Try the techniques in turn. This runs inside the engine's command loop,
+   *    which the app watches for liveness, so it has to finish well inside
+   *    that window: a test that walked every technique against an unreachable
+   *    host would look like a hang and get the running engine killed under the
+   *    user. Bounded by wall clock, not by count, because what costs time is a
+   *    host that never answers. */
   int n = strategy_preset_count();
+  uint64_t deadline = now_ms() + PROBE_BUDGET_MS;
   for (int i = 0; i < n; i++) {
+    if (now_ms() >= deadline) {
+      printf("{\"type\":\"probe\",\"host\":\"%s\",\"ok\":false,\"blocked\":true,"
+             "\"suggest\":\"advanced\",\"partial\":true,\"tried\":%d,\"dns_blocked\":%s}\n",
+             host, i, dnsb);
+      fflush(stdout);
+      return -1;
+    }
     const strategy *st = strategy_preset(i);
     if (test_strategy(host, st, cfg->use_doh)) {
       printf("{\"type\":\"probe\",\"host\":\"%s\",\"strategy\":\"%s\",\"ok\":true,"

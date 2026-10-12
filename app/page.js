@@ -9,6 +9,7 @@ import StatsPanel from '../components/StatsPanel';
 import InfoPanel from '../components/InfoPanel';
 import UpdateBanner from '../components/UpdateBanner';
 import Onboarding from '../components/Onboarding';
+import BlockedNotice from '../components/BlockedNotice';
 import { ChartIcon, InfoIcon, LogsIcon, SettingsIcon, ShieldIcon } from '../components/icons';
 import { useLanguage } from '../contexts/LanguageContext';
 
@@ -118,7 +119,9 @@ export default function Home() {
         </span>
       </header>
 
-      <Onboarding />
+      <Onboarding onNavigate={setActiveTab} />
+
+      <BlockedNotice onNavigate={setActiveTab} />
 
       <UpdateBanner />
 
@@ -148,6 +151,7 @@ export default function Home() {
               key={id}
               type="button"
               onClick={() => setActiveTab(id)}
+              data-tour={`nav-${id}`}
               aria-current={on ? 'page' : undefined}
               title={label}
               className="nav-btn flex min-w-0 flex-col items-center justify-start gap-1 px-1 pb-2 pt-2.5"

@@ -273,3 +273,9 @@ input::placeholder { color: var(--text-faint); opacity: 1; }
 @keyframes live-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
 .live-dot { animation: live-pulse 2s ease-in-out infinite; }
 @media (prefers-reduced-motion: reduce) { .live-dot { animation: none; } }
+
+/* First-run tour: the dimmed area around the control being pointed at. */
+.tour-dim {
+  background: color-mix(in srgb, var(--bg) 78%, transparent);
+  backdrop-filter: blur(2px);
+}

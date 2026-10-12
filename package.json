@@ -161,6 +161,18 @@
       "artifactName": "${productName}-${version}-Linux-${arch}.${ext}"
     },
     "deb": {
+      "depends": [
+        "libgtk-3-0",
+        "libnotify4",
+        "libnss3",
+        "libxtst6",
+        "libatspi2.0-0",
+        "libuuid1",
+        "libsecret-1-0",
+        "xdg-utils",
+        "libdrm2",
+        "libgbm1"
+      ],
       "recommends": [
         "libnetfilter-queue1"
       ]

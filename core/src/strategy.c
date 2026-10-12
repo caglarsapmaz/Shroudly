@@ -61,8 +61,13 @@ int strategy_parse(const char *spec, strategy *out) {
       char *t = strstr(args, "ttl=");
       if (t) out->fake_ttl = atoi(t + 4);
       if (strstr(args, "badsum")) out->fmode = FAKE_BADSUM;
-      op.ref = POS_SNI;
-      op.offset = 0;
+      if (strstr(args, "md5"))    out->fmode = FAKE_MD5;
+      /* Everything but the last byte, so the filter reads a whole decoy
+       * request. A negative absolute position counts back from the end. */
+      op.ref = POS_ABS;
+      op.offset = -1;
+      { char *at = strstr(args, "pos=");
+        if (at) op.offset = atoi(at + 4); }
     } else if (op.kind == OP_TLSREC || op.kind == OP_OOB) {
       op.ref = parse_ref(args, &op.offset);
       if (op.ref == POS_ABS && args[0]) op.offset = atoi(args);
@@ -77,7 +82,7 @@ int strategy_parse(const char *spec, strategy *out) {
 
 /* Presets ordered most-universal first. These mirror the techniques that work
  * against real-world DPI (split at SNI, disorder, fakes at low TTL). */
-static strategy PRESETS[20];
+static strategy PRESETS[24];
 static int N_PRESETS = 0;
 
 static void add(const char *name, const char *spec) {
@@ -122,10 +127,12 @@ static void ensure_presets(void) {
   add("split2",               "split(2)");
   add("disorder2",            "disorder(2)");
   add("split-sni-end",        "split(sni_end)");
-#ifdef SHROUDLY_RAW
-  add("fake-split-sni",       "fake(ttl=4),split(sni)");
-  add("fake-disorder-sni",    "fake(ttl=4),disorder(sni)");
-#endif
+  /* A decoy first segment, where the platform can guarantee the server never
+   * sees it (Linux, via a TCP signature key). It comes last because it is the
+   * least portable, and there is only one of it: variants that differ only in
+   * a TTL guess were removed, because a guess that lands short delivers the
+   * forged request to the origin and poisons that site for the session. */
+  add("fake-decoy",           "fake(md5,ttl=6)");
 }
 
 int strategy_preset_count(void) { ensure_presets(); return N_PRESETS; }

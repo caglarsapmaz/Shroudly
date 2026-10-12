@@ -89,6 +89,7 @@ class EngineManager {
     this.log = hooks.addLog || (() => {});
     this.onStatusChange = hooks.onStatusChange || (() => {});
     this.onProbe = hooks.onProbe || (() => {});
+    this.onSiteBlocked = hooks.onSiteBlocked || (() => {});
     this.lastProbe = null;
     this.proxyOptions = hooks.proxyOptions || {};
     this.proxy = new SystemProxy(this.log, this.proxyOptions);
@@ -101,6 +102,7 @@ class EngineManager {
     // rather than one per connection.
     this.bypassed = new Set();
     this.blockedHosts = new Set();
+    this._dnsAutoFixed = false;
     this.port = Number(store.get('listenPort', DEFAULT_PORT)) || DEFAULT_PORT;
     this.expectingStop = false;
     this.restarts = 0;
@@ -266,11 +268,18 @@ class EngineManager {
     if (d.forgedDns.length) {
       const names = d.forgedDns.map((h) => h.host).join(', ');
       if (this.store.get('dnsProtection') === false) {
-        // The user switched it off and their network is poisoning DNS: turn it
-        // back on rather than let every lookup fail.
+        // The user switched it off and their network is forging answers. The
+        // engine reads this setting once, at startup, and this check finishes
+        // after it has already started — so flipping the setting is not enough,
+        // the engine has to be restarted to pick it up. Guarded so it can only
+        // happen once per session, and not gated on `active`, which may still
+        // be false at the moment this resolves.
         this.store.set('dnsProtection', true);
         this.log('warning', `Your DNS is being tampered with (${names}). Encrypted DNS has been switched back on automatically.`);
-        if (this.active) this.restart().catch(() => {});
+        if (!this._dnsAutoFixed) {
+          this._dnsAutoFixed = true;
+          setTimeout(() => { if (this.active) this.restart().catch(() => {}); }, 1200);
+        }
       } else {
         this.log('info', `Your provider's DNS returns forged answers for ${names}; Shroudly's encrypted DNS is handling it.`);
       }
@@ -284,6 +293,12 @@ class EngineManager {
     switch (msg.type) {
       case 'ready':
         this.log('success', `Engine listening on 127.0.0.1:${msg.port}`);
+        // A session that has been up for a while has earned a fresh restart
+        // budget; otherwise a handful of crashes spread over days eventually
+        // leaves the engine refusing to come back at all.
+        clearTimeout(this._restartCredit);
+        this._restartCredit = setTimeout(() => { this.restarts = 0; }, 120000);
+        if (this._restartCredit.unref) this._restartCredit.unref();
         if (finishStart) finishStart(true);
         break;
       case 'stats':
@@ -304,14 +319,22 @@ class EngineManager {
       case 'bypass':
         this.blockedHosts.delete(msg.host);
         if (!this.bypassed.has(msg.host)) {
+          // One line per site, but the set is only there to stop repeats, so
+          // it is capped rather than allowed to track a whole session.
+          if (this.bypassed.size > 400) this.bypassed.clear();
           this.bypassed.add(msg.host);
           this.log('success', `${msg.host}: blocked here, opened with ${msg.strategy} (${msg.attempts} tries, ${msg.family})`);
         }
         break;
       case 'blocked':
         if (!this.blockedHosts.has(msg.host)) {
+          if (this.blockedHosts.size > 400) this.blockedHosts.clear();
           this.blockedHosts.add(msg.host);
           this.log('warning', `${msg.host}: still blocked after ${msg.attempts} techniques (${msg.family}) — this network may need Advanced mode`);
+          // Nobody reads a log unprompted. A site that could not be opened at
+          // all is the one moment the user needs telling, because otherwise
+          // they conclude the app simply does not work.
+          if (typeof this.onSiteBlocked === 'function') this.onSiteBlocked(msg.host);
         }
         break;
       case 'send_failed':

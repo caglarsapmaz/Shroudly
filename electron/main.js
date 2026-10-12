@@ -93,6 +93,8 @@ function isAutoStartLaunch() {
   return false;
 }
 
+let lastBlockedNotice = 0;
+
 function notify(title, body) {
   if (store.get('showNotifications', true) && Notification.isSupported()) {
     try { new Notification({ title, body, icon: trayIconPath() }).show(); } catch {}
@@ -333,6 +335,20 @@ app.whenReady().then(async () => {
       },
     },
     onProbe: (p) => { if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('dpi:probe-result', p); },
+    // A site that defeated every technique. Told once per site, and at most
+    // once every few minutes, so a page full of blocked resources cannot turn
+    // into a stream of notifications.
+    onSiteBlocked: (host) => {
+      const now = Date.now();
+      if (now - lastBlockedNotice < 5 * 60 * 1000) return;
+      lastBlockedNotice = now;
+      notify(tr().siteBlockedTitle, tr().siteBlockedBody.replace('{host}', host));
+      if (mainWindow && !mainWindow.isDestroyed()) {
+        mainWindow.webContents.send('dpi:site-blocked', { host });
+        if (!mainWindow.isVisible()) mainWindow.show();
+        mainWindow.focus();
+      }
+    },
   });
   advanced = new AdvancedMode(addLog);
   await engine.recover();

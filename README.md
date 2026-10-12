@@ -139,6 +139,17 @@ model and test results.
 - **System tray, auto-start, auto mode** — per-OS login item on Windows/macOS, `.desktop` entry on Linux.
 - **15 languages** with automatic detection.
 
+## What it runs on
+
+| | Minimum | Notes |
+|---|---|---|
+| Windows | **Windows 10** (x64 or ARM64) | The installer stops with a clear message on Windows 8.1 and earlier, which Electron no longer supports. |
+| macOS | **macOS 12 Monterey** (Intel or Apple Silicon) | Older versions are told so by macOS itself rather than failing to launch. |
+| Linux | **glibc 2.28+** — Debian 10, Ubuntu 18.04, Fedora 29 or newer | AppImage (x64, ARM64) and .deb (x64). The bypass engine itself only needs glibc 2.17, so it is never the limiting part. |
+
+Advanced mode needs administrator rights, and is available on Windows and Linux only.
+
+
 ### Languages
 
 English, 中文, हिन्दी, Español, العربية, Русский, Português, Français, فارسی, Türkçe, বাংলা, اردو, Bahasa Indonesia, 日本語, Deutsch

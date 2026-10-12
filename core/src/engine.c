@@ -25,14 +25,15 @@
  * attempt is refused do we start trying desync strategies, and the one that
  * works is remembered per host, so the cost is paid once. */
 #define ATT_PLAIN      (-2)    /* send the payload unmodified */
-#define ATT_MAX         6
+#define ATT_MAX         12
 #define ATT_BUDGET_MS   15000
 #define VERIFY_PLAIN_MS 2500
 #define VERIFY_DESYNC_MS 3500
 
 /* Outcome of one attempt. */
 #define ATT_OK      1   /* server answered */
-#define ATT_REFUSED 0   /* reset / closed / silence: looks like filtering */
+#define ATT_REFUSED 0   /* reset or closed: the connection was refused */
+#define ATT_SILENT  2   /* nothing came back at all: could be a slow server */
 #define ATT_LOCAL  (-1) /* our own send failed */
 
 static engine_config  g_cfg;
@@ -228,11 +229,14 @@ static int read_first(sock_t c, uint8_t *buf, int cap) {
     int n = recv(c, (char *)buf + total, cap - total, 0);
     if (n <= 0) break;
     total += n;
-    if (want == 0) {
+    /* tls_expected_len answers 5 while it has only part of the header, so keep
+     * asking until it knows the real record length — otherwise a ClientHello
+     * that arrives in pieces is cut off after five bytes. */
+    if (want == 0 || want == 5) {
       want = tls_expected_len(buf, (size_t)total);
       if (want == 0) break;          /* not TLS: first recv is the HTTP request */
     }
-    if (want > 0 && total >= want) break;
+    if (want > 5 && total >= want) break;
   }
   return total > 0 ? total : -1;
 }
@@ -251,11 +255,27 @@ static int retry_safe(const proto_info *pi, const uint8_t *b, int len) {
 /* One line of JSON per interesting event, read by the app and written to the
  * log the user can send us. Hosts are reported because the user asked for the
  * site, but nothing is sent anywhere: it only reaches the local log file. */
+/* The host comes from whatever asked us to connect, so it cannot be pasted
+ * into JSON as-is: one quote would corrupt this line and every line after it,
+ * and the app parses these. Keep it to characters a host name may contain. */
+static void json_host(char *out, size_t cap, const char *in) {
+  size_t j = 0;
+  for (size_t i = 0; in && in[i] && j + 1 < cap; i++) {
+    unsigned char c = (unsigned char)in[i];
+    int ok = (c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+             (c >= '0' && c <= '9') || c == '.' || c == '-' || c == ':' || c == '_';
+    out[j++] = ok ? (char)c : '?';
+  }
+  out[j] = 0;
+}
+
 static void report(const char *ev, const char *host, const char *strat,
                    int attempts, int fam) {
+  char h[256];
+  json_host(h, sizeof(h), host);
   printf("{\"type\":\"%s\",\"host\":\"%s\",\"strategy\":\"%s\","
          "\"attempts\":%d,\"family\":\"%s\"}\n",
-         ev, host, strat ? strat : "", attempts, fam == AF_INET6 ? "ipv6" : "ipv4");
+         ev, h, strat ? strat : "", attempts, fam == AF_INET6 ? "ipv6" : "ipv4");
   fflush(stdout);
 }
 
@@ -265,18 +285,21 @@ static void report(const char *ev, const char *host, const char *strat,
  * real TLS handshake record, and a ServerHello if it is a handshake at all.
  * Without this check a block page counts as success and gets cached. */
 static int tls_reply_ok(const uint8_t *b, int n) {
-  if (n < 1) return 0;
-  if (b[0] < 0x14 || b[0] > 0x18) return 0;      /* not a TLS record type */
-  if (n < 2) return 1;
+  if (n < 3) return 0;
+  /* Only a handshake counts. An alert (0x15) is the server saying the
+   * handshake failed — which is exactly what a technique that corrupts the
+   * request produces, so accepting it would cache the corruption and keep
+   * using it for that site. */
+  if (b[0] != 0x16) return 0;
   if (b[1] != 0x03) return 0;                    /* legacy record version */
-  if (b[0] == 0x16 && n >= 6 && b[5] != 0x02) return 0;  /* handshake, not ServerHello */
+  if (n >= 6 && b[5] != 0x02) return 0;          /* a handshake, but not ServerHello */
   return 1;
 }
 
 /* Send the first payload using `preset` (or unmodified for ATT_PLAIN), then
  * wait for the server to say something. On success the server's first bytes
  * are left in `rbuf` and their length stored in `*rlen`. */
-static int attempt(sock_t up, int fam, uint8_t *payload, int len,
+static int attempt(sock_t up, int fam, uint8_t *payload, int pcap, int len,
                    const proto_info *pi, int preset, int wait_ms,
                    uint8_t *rbuf, int rcap, int *rlen) {
   *rlen = 0;
@@ -284,14 +307,14 @@ static int attempt(sock_t up, int fam, uint8_t *payload, int len,
     if (sock_send_all(up, payload, (size_t)len, 0) != 0) return ATT_LOCAL;
   } else {
     const strategy *st = (preset >= 0) ? strategy_preset(preset) : &g_cfg.strat;
-    if (desync_send_first(up, fam, payload, len, rcap, pi, st, &g_stats.desync_applied) != 0)
+    if (desync_send_first(up, fam, payload, len, pcap, pi, st, &g_stats.desync_applied) != 0)
       return ATT_LOCAL;
   }
   atomic_fetch_add(&g_stats.bytes_up, (uint64_t)len);
 
   int w = sock_wait_readable(up, wait_ms);
   if (w < 0) return ATT_REFUSED;
-  if (w == 0) return ATT_REFUSED;        /* blackholed */
+  if (w == 0) return ATT_SILENT;         /* blackholed, or merely slow */
   int n = recv(up, (char *)rbuf, rcap, 0);
   if (n <= 0) return ATT_REFUSED;        /* RST or FIN injected by the filter */
 
@@ -363,6 +386,7 @@ static void handle(sock_t client) {
     }
 
     uint64_t deadline = now_ms() + ATT_BUDGET_MS;
+    int saw_refusal = 0;
     for (int a = 0; a < ncand; a++) {
       if (a > 0) {
         /* Anything the client sent meanwhile belongs in the replay. */
@@ -377,9 +401,11 @@ static void handle(sock_t client) {
       }
       memcpy(work, first, (size_t)flen);   /* strategies may rewrite in place */
       int wait_ms = (cand[a] == ATT_PLAIN) ? VERIFY_PLAIN_MS : VERIFY_DESYNC_MS;
-      int r = attempt(up, fam, work, flen, &pi, cand[a], wait_ms, rbuf, RELAY_BUF, &rlen);
+      int r = attempt(up, fam, work, RELAY_BUF, flen, &pi, cand[a], wait_ms, rbuf, RELAY_BUF, &rlen);
       if (r == ATT_OK) {
-        if (ladder && cand[a] >= 0) hs_put(key, cand[a]);
+        /* Remember the technique only when we actually saw a refusal. A server
+         * that was merely slow must not leave this host permanently desynced. */
+        if (ladder && cand[a] >= 0 && saw_refusal) hs_put(key, cand[a]);
         atomic_fetch_add(&g_stats.probe_success, 1);
         /* Only worth reporting when something had to be done about it: a site
          * that opened untouched is not news, one that needed a technique is. */
@@ -391,6 +417,7 @@ static void handle(sock_t client) {
         if (r == ATT_LOCAL) report("send_failed", key, "", a + 1, fam);
         break;
       }
+      if (r == ATT_REFUSED) saw_refusal = 1;
       atomic_fetch_add(&g_stats.probe_fail, 1);
       if (a + 1 >= ncand || now_ms() >= deadline) {
         /* Nothing got through. This line is what a support log needs: the host,

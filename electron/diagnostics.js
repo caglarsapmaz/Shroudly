@@ -21,6 +21,13 @@ const os = require('os');
 const dns = require('dns');
 const { execFile } = require('child_process');
 
+/* System tools are addressed absolutely. Launching them by bare name lets
+ * anything earlier on PATH answer instead, and this runs at every start. */
+function winTool(rel) {
+  const root = process.env.SystemRoot || process.env.windir || 'C:\\Windows';
+  return `${root}\\System32\\${rel}`;
+}
+
 const run = (cmd, args, ms = 4000) => new Promise((resolve) => {
   try {
     const p = execFile(cmd, args, { timeout: ms, windowsHide: true },
@@ -55,7 +62,7 @@ const CONFLICTS = [
 
 async function runningTools() {
   const out = process.platform === 'win32'
-    ? await run('tasklist', ['/fo', 'csv', '/nh'])
+    ? await run(winTool('tasklist.exe'), ['/fo', 'csv', '/nh'])
     : await run('/bin/ps', ['-A', '-o', 'comm=']);
   if (!out) return [];
   const found = new Set();
@@ -78,11 +85,13 @@ async function defaultRoute() {
       return m ? m[1] : '';
     }
     if (process.platform === 'linux') {
-      const o = await run('ip', ['route', 'show', 'default']);
+      const o = await run('/sbin/ip', ['route', 'show', 'default']) ||
+                await run('/usr/sbin/ip', ['route', 'show', 'default']) ||
+                await run('/bin/ip', ['route', 'show', 'default']);
       const m = o.match(/\sdev\s+(\S+)/);
       return m ? m[1] : '';
     }
-    const o = await run('powershell', ['-NoProfile', '-Command',
+    const o = await run(winTool('WindowsPowerShell\\v1.0\\powershell.exe'), ['-NoProfile', '-Command',
       '(Get-NetRoute -DestinationPrefix 0.0.0.0/0 | Sort-Object RouteMetric | Select-Object -First 1).InterfaceAlias'], 6000);
     return o.trim();
   } catch { return ''; }

@@ -20,8 +20,8 @@ const outRoot = path.join(root, 'electron', 'tools', 'core');
 const TARGETS = {
   'win32-x64':  { zig: 'x86_64-windows-gnu',   bin: 'shroudly-core.exe', libs: ['-lws2_32', '-liphlpapi'] },
   'win32-arm64':{ zig: 'aarch64-windows-gnu',  bin: 'shroudly-core.exe', libs: ['-lws2_32', '-liphlpapi'] },
-  'linux-x64':  { zig: 'x86_64-linux-gnu',     bin: 'shroudly-core',     libs: ['-lpthread'] },
-  'linux-arm64':{ zig: 'aarch64-linux-gnu',    bin: 'shroudly-core',     libs: ['-lpthread'] },
+  'linux-x64':  { zig: 'x86_64-linux-gnu.2.17',     bin: 'shroudly-core',     libs: ['-lpthread'] },
+  'linux-arm64':{ zig: 'aarch64-linux-gnu.2.17',    bin: 'shroudly-core',     libs: ['-lpthread'] },
   'darwin-x64': { zig: 'x86_64-macos-none',    bin: 'shroudly-core',     libs: [] },
   'darwin-arm64':{ zig: 'aarch64-macos-none',  bin: 'shroudly-core',     libs: [] },
 };

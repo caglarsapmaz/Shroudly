@@ -1,4 +1,5 @@
 #include "desync.h"
+#include "fake.h"
 #include <string.h>
 #include <stdlib.h>
 
@@ -11,7 +12,7 @@ static int resolve_pos(pos_ref ref, int offset, int len, const proto_info *pi) {
     case POS_SNI_END: base = pi->host_off >= 0 ? pi->host_off + pi->host_len : len / 2; break;
     case POS_HOST:    base = pi->http_hdr_off >= 0 ? pi->http_hdr_off : len / 2; break;
     case POS_ABS:
-    default:          base = offset; offset = 0; break;
+    default:          base = offset < 0 ? len + offset : offset; offset = 0; break;
   }
   int p = base + offset;
   if (p < 1) p = 1;
@@ -81,7 +82,11 @@ static int send_disordered(sock_t up, int family, const uint8_t *buf,
 static int tls_insert_record(uint8_t *buf, int len, int cap, int rec_total, int pos) {
   if (len < 7 || buf[0] != 0x16) return -1;
   if (len + 5 > cap) return -1;
-  int total = (rec_total > 0 && rec_total <= len) ? rec_total : len;
+  /* Re-framing half a record would hand the server two records whose lengths
+   * describe bytes that never arrive, so only do it when the whole record is
+   * here. */
+  if (rec_total <= 0 || rec_total > len) return -1;
+  int total = rec_total;
   int body  = total - 5;
   if (body < 2) return -1;
   int n1 = pos - 5;                     /* bytes of body in the first record */
@@ -106,11 +111,12 @@ static int tls_insert_record(uint8_t *buf, int len, int cap, int rec_total, int 
  * corrupted server name. Placing it inside the SNI is the point. */
 static int send_oob_at(sock_t up, uint8_t *buf, int len, int pos) {
   if (pos < 1 || pos >= len) return -2;
-  uint8_t saved = buf[pos];
-  buf[pos] = (uint8_t)'a';
-  int rc = sock_send_all(up, buf, (size_t)pos + 1, MSG_OOB);
-  buf[pos] = saved;
-  if (rc != 0) return -1;
+  /* Send the leading bytes normally, then the urgent byte on its own. Passing
+   * MSG_OOB to a loop that retries partial sends would mark a byte urgent in
+   * every chunk it sent, which corrupts the stream the server rebuilds. */
+  if (pos > 0 && sock_send_all(up, buf, (size_t)pos, 0) != 0) return -1;
+  uint8_t urgent = (uint8_t)'a';
+  if (send(up, (const char *)&urgent, 1, MSG_OOB) != 1) return -1;
   sock_wait_sent(up, 10);
   /* The urgent byte stood in for buf[pos], so the real stream resumes there. */
   return sock_send_all(up, buf + pos, (size_t)(len - pos), 0);
@@ -168,12 +174,24 @@ int desync_send_first(sock_t up, int family,
     break;
   }
 
-  /* A "fake" op is accepted by the parser but has no effect here: a decoy
-   * segment must never reach the server, and TCP retransmits anything it has
-   * not had acknowledged, so suppressing it needs the packet layer (raw socket
-   * / NFQUEUE / WinDivert) or TCP_REPAIR. That is the optional advanced
-   * backend; the portable build relies on tlsrec, split and disorder, which
-   * between them defeat both stateless and reassembling filters. */
+  /* A decoy first segment, where the platform can take one back. The filter
+   * reads a complete request for a harmless name and makes its decision on
+   * that; the server is never given those bytes, and receives the real request
+   * when TCP resends the segment. Not built on macOS — see fake.h. */
+  for (int i = 0; i < st->n_ops; i++) {
+    if (st->ops[i].kind != OP_FAKE || !fake_available()) continue;
+    int pos = resolve_pos(st->ops[i].ref, st->ops[i].offset, len, pi);
+    int done = fake_send_first(up, family, payload, pos, pi,
+                               st->fake_ttl, st->fmode == FAKE_MD5);
+    if (done <= 0) break;                 /* could not: fall through to the rest */
+    if (desync_counter) (*desync_counter)++;
+    /* Bytes the decoy covered are already in flight and will arrive for real;
+     * send whatever it did not reach. */
+    if (done < len)
+      return sock_send_all(up, payload + done, (size_t)(len - done), 0);
+    return 0;
+  }
+
 
   for (int i = 1; i < nsplits; i++) {   /* insertion sort, ascending */
     int v = splits[i], j = i - 1;

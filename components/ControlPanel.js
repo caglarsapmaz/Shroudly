@@ -86,6 +86,7 @@ export default function ControlPanel({ dpiStatus, onStatusChange }) {
           onClick={onClick}
           disabled={loading}
           aria-busy={loading}
+          data-tour="power"
           className={`btn w-full max-w-xs rounded-[var(--radius)] px-5 py-3.5 text-[15px] font-semibold ${active ? 'btn-danger' : 'btn-primary'}`}
         >
           {loading

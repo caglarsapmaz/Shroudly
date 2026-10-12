@@ -50,22 +50,48 @@ export default function UpdateBanner() {
     );
   }
 
+  const downloading = u.status === 'downloading';
+
+  /* One line, always. The banner sits above the whole app, so anything that
+   * wraps pushes the content down and the window starts to look broken — the
+   * text truncates instead, and the download progress is a hairline along the
+   * bottom edge rather than a row of its own. */
   return (
-    <div role="status" className="no-drag mx-4 mb-3 rounded-[var(--radius-sm)] border px-3 py-2.5 sm:mx-5"
-         style={{ background: 'var(--accent-soft)', borderColor: 'var(--accent-line)' }}>
-      <div className="flex flex-wrap items-center gap-x-3 gap-y-2">
-        <span className="flex min-w-0 flex-1 items-center gap-2 text-[13px] font-medium leading-snug" style={{ color: 'var(--text)' }}>
-          <RefreshIcon className={`h-4 w-4 ${u.status === 'downloading' ? 'spin' : ''}`} style={{ color: 'var(--accent)' }} />
-          <span className="min-w-0 wrap-anywhere">{text}</span>
+    <div
+      role="status"
+      className="no-drag relative mx-4 mb-3 overflow-hidden rounded-[var(--radius-sm)] border py-2 pl-3 pr-2 sm:mx-5"
+      style={{ background: 'var(--accent-soft)', borderColor: 'var(--accent-line)' }}
+    >
+      <div className="flex items-center gap-2.5">
+        <RefreshIcon
+          className={`h-4 w-4 shrink-0 ${downloading ? 'spin' : ''}`}
+          style={{ color: 'var(--accent)' }}
+        />
+        <span
+          className="min-w-0 flex-1 truncate text-[13px] font-medium leading-snug"
+          style={{ color: 'var(--text)' }}
+          title={text}
+        >
+          {text}
         </span>
-        {actions && <span className="flex shrink-0 flex-wrap gap-2">{actions}</span>}
+        {actions && <span className="flex shrink-0 items-center gap-1.5">{actions}</span>}
       </div>
-      {u.status === 'downloading' && (
-        <div className="mt-2 h-1 overflow-hidden rounded-full" style={{ background: 'var(--line)' }}>
-          <div className="h-full rounded-full transition-[width] duration-300" style={{ width: `${u.percent || 0}%`, background: 'var(--accent)' }} />
+
+      {/* Only the cases that genuinely need a second line get one. */}
+      {detail && !downloading && (
+        <p className="mt-1 pl-[26px] text-[12px] leading-snug" style={{ color: 'var(--text-dim)' }}>
+          {detail}
+        </p>
+      )}
+
+      {downloading && (
+        <div className="absolute inset-x-0 bottom-0 h-[2px]" style={{ background: 'var(--line)' }}>
+          <div
+            className="h-full transition-[width] duration-300"
+            style={{ width: `${u.percent || 0}%`, background: 'var(--accent)' }}
+          />
         </div>
       )}
-      {detail && <p className="mt-1.5 text-[12px] leading-snug" style={{ color: 'var(--text-dim)' }}>{detail}</p>}
     </div>
   );
 }

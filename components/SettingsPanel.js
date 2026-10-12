@@ -63,9 +63,22 @@ function normalizeHost(input) {
   return h.toLowerCase();
 }
 
-function Section({ title, Icon, titleId, children }) {
+/* Mirrors SystemProxy.isHostname in the main process. The list is written into
+ * the file the browser consults for EVERY request, so a malformed entry would
+ * not simply be ignored — it would stop proxy resolution and take all browsing
+ * with it. Rather than fail quietly, bad lines are dropped and named. */
+function isHostname(d) {
+  if (typeof d !== 'string' || d.length < 3 || d.length > 253) return false;
+  if (!/^[a-z0-9.-]+$/.test(d)) return false;
+  if (d.startsWith('.') || d.endsWith('.') || d.includes('..')) return false;
+  const labels = d.split('.');
+  if (labels.length < 2) return false;
+  return labels.every((l) => l.length >= 1 && l.length <= 63 && !l.startsWith('-') && !l.endsWith('-'));
+}
+
+function Section({ title, Icon, titleId, tour, children }) {
   return (
-    <section className="card p-4">
+    <section className="card p-4" data-tour={tour}>
       {title && (
         <h2 id={titleId} className="mb-3 flex items-center gap-2 text-[13px] font-semibold leading-snug" style={{ color: 'var(--text-dim)' }}>
           {Icon && <Icon className="h-4 w-4" style={{ color: 'var(--text-faint)' }} />}
@@ -146,7 +159,8 @@ export default function SettingsPanel({ active = false }) {
   // null while unknown; false greys out "Prefer IPv6" on IPv4-only networks
   const [ipv6Ok, setIpv6Ok] = useState(null);
   const [defaultList, setDefaultList] = useState([]);
-  const [siteText, setSiteText] = useState(null); // textarea draft (null until loaded)
+  const [siteText, setSiteText] = useState(null);   // textarea draft (null until loaded)
+  const [badEntries, setBadEntries] = useState([]); // lines dropped as unusable
 
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electron?.defaultSiteList) return;
@@ -316,7 +330,7 @@ export default function SettingsPanel({ active = false }) {
       </Section>
 
       {/* Routing: which sites go through Shroudly */}
-      <Section title={t('routing')} Icon={GlobeIcon}>
+      <Section title={t('routing')} Icon={GlobeIcon} tour="routing">
         <Select
           value={settings.routeMode === 'listed' ? 'listed' : 'all'}
           options={[
@@ -343,8 +357,14 @@ export default function SettingsPanel({ active = false }) {
               value={siteText == null ? (settings.siteList || defaultList).join('\n') : siteText}
               onChange={(e) => setSiteText(e.target.value)}
               onBlur={() => {
-                const list = (siteText || '')
-                  .split(/[\s,]+/).map((d) => d.trim().toLowerCase()).filter(Boolean);
+                const entries = (siteText || '')
+                  .split(/[\s,]+/)
+                  .map((d) => d.trim().toLowerCase().replace(/^https?:\/\//, '').replace(/^\*?\./, '').replace(/\/.*$/, ''))
+                  .filter(Boolean);
+                const list = [...new Set(entries.filter(isHostname))];
+                const dropped = [...new Set(entries.filter((d) => !isHostname(d)))];
+                setBadEntries(dropped);
+                setSiteText(list.join('\n'));   // show the cleaned list back
                 save('siteList', list);
               }}
               spellCheck={false} rows={6} dir="ltr"
@@ -352,6 +372,14 @@ export default function SettingsPanel({ active = false }) {
               className="mono w-full resize-y rounded-[var(--radius-sm)] p-2.5 text-[12.5px] leading-relaxed outline-none"
               style={{ background: 'var(--surface-2)', border: '1px solid var(--line)', color: 'var(--text)' }}
             />
+            {badEntries.length > 0 && (
+              <p className="mt-1.5 flex items-start gap-2 text-[12px] leading-snug" style={{ color: 'var(--warn)' }}>
+                <AlertTriangleIcon className="mt-[1px] h-3.5 w-3.5 shrink-0" />
+                <span className="min-w-0 wrap-anywhere">
+                  {t('siteListDropped', { entries: badEntries.slice(0, 4).join(', ') + (badEntries.length > 4 ? '…' : '') })}
+                </span>
+              </p>
+            )}
             <p className="mt-1.5 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>{t('siteListHint')}</p>
           </div>
         )}
@@ -365,7 +393,7 @@ export default function SettingsPanel({ active = false }) {
       </Section>
 
       {/* Test a site */}
-      <Section title={t('testSite')} Icon={SearchIcon}>
+      <Section title={t('testSite')} Icon={SearchIcon} tour="sitetest">
         <p className="mb-3 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>{t('testSiteDesc')}</p>
         <form
           className="flex flex-wrap gap-2"
