@@ -90,9 +90,56 @@ export class Presence {
   }
 }
 
+/* ── always-latest download redirects ─────────────────────────────────────
+ * /dl                -> the latest release page
+ * /dl/<key>          -> 302 to that platform's installer in the latest release
+ * The latest-release lookup is cached ~10 min so GitHub's unauthenticated API
+ * limit is never a problem. */
+const DL_PATTERNS = {
+  'windows-x64':  /Windows-x64-Setup\.exe$/i,
+  'windows-arm64':/Windows-arm64-Setup\.exe$/i,
+  'macos-arm64':  /macOS-arm64\.dmg$/i,
+  'macos-x64':    /macOS-x64\.dmg$/i,
+  'macos-arm64-zip': /macOS-arm64\.zip$/i,
+  'macos-x64-zip': /macOS-x64\.zip$/i,
+  'linux-x64':    /Linux-x86_64\.AppImage$/i,
+  'linux-arm64':  /Linux-arm64\.AppImage$/i,
+  'linux-deb':    /Linux-amd64\.deb$/i,
+};
+const RELEASES_LATEST = 'https://github.com/umutxyp/Shroudly/releases/latest';
+
+async function latestRelease(ctx) {
+  const cache = caches.default;
+  const cacheKey = new Request('https://shroudly.codeshare.me/__latest_release');
+  let res = await cache.match(cacheKey);
+  if (!res) {
+    const gh = await fetch('https://api.github.com/repos/umutxyp/Shroudly/releases/latest', {
+      headers: { 'user-agent': 'shroudly-dl', accept: 'application/vnd.github+json' },
+    });
+    if (!gh.ok) return null;
+    res = new Response(await gh.text(), { headers: { 'content-type': 'application/json', 'cache-control': 'public, max-age=600' } });
+    ctx.waitUntil(cache.put(cacheKey, res.clone()));
+  }
+  try { return JSON.parse(await res.text()); } catch { return null; }
+}
+
+async function handleDownload(pathname, ctx) {
+  const key = pathname.replace(/^\/dl\/?/, '');
+  if (!key) return Response.redirect(RELEASES_LATEST, 302);
+  const pat = DL_PATTERNS[key];
+  if (!pat) return new Response('unknown download key', { status: 404 });
+  const rel = await latestRelease(ctx);
+  const asset = rel && (rel.assets || []).find((a) => pat.test(a.name));
+  if (!asset) return Response.redirect(RELEASES_LATEST, 302);
+  return Response.redirect(asset.browser_download_url, 302);
+}
+
 export default {
-  async fetch(request, env) {
+  async fetch(request, env, ctx) {
     const { pathname } = new URL(request.url);
+    if (request.method === 'GET' && (pathname === '/dl' || pathname.startsWith('/dl/'))) {
+      return handleDownload(pathname, ctx);
+    }
     const route = `${request.method} ${pathname}`;
     if (route === 'POST /v1/ping' || route === 'POST /v1/leave' || route === 'GET /v1/online') {
       const stub = env.PRESENCE.get(env.PRESENCE.idFromName('global'));
