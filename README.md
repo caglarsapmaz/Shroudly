@@ -124,6 +124,49 @@ model and test results.
 
 ---
 
+## Discord app mode (macOS)
+
+In a browser Discord works through Shroudly as usual, but the Discord **desktop
+app** on macOS stays on *"Checking for updates"* / *"Update failed"*. Its
+updater ignores the system proxy and speaks only TLS 1.2 (macOS Secure
+Transport). In TLS 1.2 the server's certificate is sent in the clear, so the
+DPI sees `discord.com` in the server's reply and cuts the connection, whatever
+is done to the ClientHello. TLS 1.3 encrypts the certificate, which is why
+browsers get through.
+
+Discord app mode fixes this with a small **update relay** inside Shroudly
+(`electron/update-relay.js`):
+
+- It listens on `http://127.0.0.1:10809/` (loopback only) and forwards only
+  `GET`/`HEAD` requests for Discord's own domains.
+- Each request is repeated to the real server over **TLS 1.3** through
+  Shroudly's engine, so it gets the usual desync and encrypted DNS.
+- Package URLs in Discord's update manifest are rewritten to come back through
+  the relay. Packages are passed through unchanged, and Discord checks every
+  one against the SHA-256 in its manifest.
+
+> **What this mode changes outside Shroudly.** To point Discord's updater at
+> the relay, Shroudly edits **another app's file**: it adds one line,
+> `"NEW_UPDATE_ENDPOINT": "http://127.0.0.1:10809/"`, to Discord's
+> `~/Library/Application Support/discord/settings.json` (also `discordptb` /
+> `discordcanary` if installed), and removes that line again when the mode is
+> turned off. Shroudly says this in a dialog before it changes anything.
+>
+> - Discord rewrites that file when it quits, so if Discord is open Shroudly
+>   asks first, then quits Discord, edits the file and opens Discord again.
+> - macOS may ask once to let Shroudly access Discord's data. If it refuses,
+>   Shroudly opens a folder picker already inside Discord's folder: one click
+>   on *Allow access* grants it.
+> - **While the mode is on, the Discord app can only update and open while
+>   Shroudly is running.** Turn the mode off before uninstalling Shroudly or
+>   switching to a VPN.
+
+On a Mac with the Discord app installed, Shroudly offers the mode once on first
+launch; afterwards it is under *Settings → Discord app mode*. Voice channels
+work as well. They use UDP, which does not go through the relay.
+
+---
+
 ## Features
 
 - **Cross-platform** — one engine, native builds for Windows, macOS and Linux (x64 and arm64).

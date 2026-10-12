@@ -159,6 +159,8 @@ export default function SettingsPanel({ active = false }) {
   });
   // null while unknown; false greys out "Prefer IPv6" on IPv4-only networks
   const [ipv6Ok, setIpv6Ok] = useState(null);
+  // App mode exists on macOS only; known after mount (the page is prerendered)
+  const [isMac, setIsMac] = useState(false);
   const [defaultList, setDefaultList] = useState([]);
   const [siteText, setSiteText] = useState(null);   // textarea draft (null until loaded)
   const [badEntries, setBadEntries] = useState([]); // lines dropped as unusable
@@ -175,6 +177,10 @@ export default function SettingsPanel({ active = false }) {
   useEffect(() => {
     if (typeof window === 'undefined' || !window.electron?.ipv6Available) return;
     window.electron.ipv6Available().then(setIpv6Ok).catch(() => {});
+  }, []);
+
+  useEffect(() => {
+    if (typeof window !== 'undefined') setIsMac(window.electron?.platform === 'darwin');
   }, []);
 
   useEffect(() => {
@@ -363,6 +369,11 @@ export default function SettingsPanel({ active = false }) {
                   checked={settings.preferIpv6}
                   disabled={ipv6Ok === false && !settings.preferIpv6}
                   onChange={(v) => save('preferIpv6', v)} />
+          {isMac && (
+            <Toggle label={t('appMode')} desc={t('appModeDesc')}
+                    checked={settings.appMode === true}
+                    onChange={(v) => save('appMode', v)} />
+          )}
         </div>
 
         {active && (

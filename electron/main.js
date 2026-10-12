@@ -1,6 +1,6 @@
 'use strict';
 
-const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell, Notification, powerMonitor } = require('electron');
+const { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, shell, Notification, powerMonitor, dialog } = require('electron');
 const path = require('path');
 const url = require('url');
 const fs = require('fs');
@@ -10,6 +10,8 @@ const Store = require('electron-store');
 const EngineManager = require('./engine-manager');
 const SystemProxy = require('./system-proxy');
 const AdvancedMode = require('./advanced-mode');
+const DiscordSettings = require('./discord-settings');
+const { RELAY_PORT } = require('./update-relay');
 const Updater = require('./updater');
 const Presence = require('./presence');
 const i18n = require('./main-i18n');
@@ -139,6 +141,8 @@ function systemLanguages() {
 function tr() {
   return i18n.strings(i18n.resolveLanguage(store.get('language'), systemLanguages()));
 }
+/* For strings only some languages have yet: fall back to English. */
+function trOr(key) { return tr()[key] || i18n.strings('en')[key] || key; }
 
 let trayActive = false;
 function rebuildTrayMenu(active = trayActive) {
@@ -418,6 +422,19 @@ app.whenReady().then(async () => {
       addLog('info', 'Auto Mode: starting protection');
       setTimeout(() => { safeStart(); }, 1200);
     }
+    // A Mac with the Discord app installed: offer Discord app mode once, so
+    // installing Shroudly and opening Discord is all it takes.
+    if (store.get('appMode') === undefined && DiscordSettings.installed().length) {
+      setTimeout(async () => {
+        const parent = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : undefined;
+        const { response } = await dialog.showMessageBox(parent, {
+          type: 'question', buttons: [trOr('discordAskYes'), trOr('discordAskNo')], defaultId: 0, cancelId: 1,
+          message: trOr('discordAskTitle'), detail: trOr('discordAskBody'),
+        });
+        if (response === 0) await setDiscordMode(true, { confirmed: true });
+        if (store.get('appMode') === undefined) store.set('appMode', false);
+      }, 2500);
+    }
   });
 
   if (isDev) {
@@ -565,7 +582,92 @@ ipcMain.handle('settings:defaultSiteList', () => EngineManager.DEFAULT_SITE_LIST
 ipcMain.handle('presence:get', () => (presence ? presence.online : null));
 ipcMain.handle('presence:refresh', () => (presence ? presence.refresh() : null));
 
-ipcMain.handle('settings:set', (e, key, value) => {
+/* Discord app mode (macOS): run the update relay and point Discord's
+ * settings.json at it, or undo both. Discord is quit while its file changes
+ * (it rewrites the file when it quits) and opened again afterwards. Stored
+ * only when it worked, so a cancelled dialog leaves the toggle as it was. */
+async function setDiscordMode(on, { confirmed = false } = {}) {
+  // A sheet on a hidden window (started into the tray) would never be seen.
+  const win = mainWindow && !mainWindow.isDestroyed() && mainWindow.isVisible() ? mainWindow : undefined;
+  const variants = DiscordSettings.installed();
+  const running = [];
+  for (const v of variants) if ((await DiscordSettings.pids(v)).length) running.push(v);
+
+  // Turning it on changes another app's settings: say exactly what happens
+  // before doing anything. (The first-run question already said it.)
+  if (on && !confirmed) {
+    const detail = trOr('discordEnableBody') + (running.length ? `\n\n${trOr('discordRestartBody')}` : '');
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'info', buttons: [trOr('discordAskYes'), trOr('cancel')], defaultId: 0, cancelId: 1,
+      message: trOr('discordEnableTitle'), detail,
+    });
+    if (response !== 0) return { success: false, code: 'cancelled' };
+  } else if (running.length && !confirmed) {
+    const { response } = await dialog.showMessageBox(win, {
+      type: 'question', buttons: [trOr('discordRestartOk'), trOr('cancel')], defaultId: 0, cancelId: 1,
+      message: trOr('discordRestartTitle'), detail: trOr('discordRestartBody'),
+    });
+    if (response !== 0) return { success: false, code: 'cancelled' };
+  }
+
+  // On: the relay must be up before Discord starts asking it for updates.
+  const before = store.get('appMode');
+  store.set('appMode', on);
+  if (engine) {
+    if (on && !engine.isActive()) await safeStart();
+    else await engine.syncRelay();
+  }
+
+  for (const v of running) await DiscordSettings.quit(v);
+
+  const url = on ? DiscordSettings.endpointUrl(RELAY_PORT) : null;
+  const line = `"${DiscordSettings.KEY}": "${DiscordSettings.endpointUrl(RELAY_PORT)}"`;
+  let failed = false;
+  for (const v of variants) {
+    const file = DiscordSettings.settingsFile(v);
+    try {
+      await DiscordSettings.patchFile(file, url);
+    } catch (e) {
+      if (e.code !== 'EPERM' && e.code !== 'EACCES') { addLog('error', `Discord app mode: ${e.message}`); failed = true; continue; }
+      // macOS guards other apps' data; a folder the user picks counts as
+      // consent. An open panel cannot preselect a file, but it can open inside
+      // Discord's folder, where pressing Open with nothing selected chooses
+      // that folder: one click, no searching.
+      const dir = path.dirname(file);
+      const pick = await dialog.showOpenDialog(win, {
+        defaultPath: dir, properties: ['openDirectory'], message: trOr('discordPickMessage'),
+        buttonLabel: trOr('discordPickButton'),
+      });
+      try {
+        if (pick.canceled || !pick.filePaths[0]) throw new Error('no folder chosen');
+        const chosen = pick.filePaths[0];
+        if (path.basename(chosen) !== path.basename(dir)) throw new Error(`${chosen} is not Discord's folder`);
+        await DiscordSettings.patchFile(path.join(chosen, 'settings.json'), url);
+      } catch (e2) {
+        addLog('error', `Discord app mode: could not change ${file} (${e2.message})`);
+        failed = true;
+      }
+    }
+  }
+
+  for (const v of running) await DiscordSettings.launch(v);
+
+  if (failed) {
+    // Leave things as they were: turning off with the line still in Discord's
+    // file would strand Discord on a relay that is no longer there.
+    store.set('appMode', before === true);
+    if (engine) await engine.syncRelay();
+    const msg = on ? trOr('discordEditFailed') : trOr('discordRemoveFailed');
+    dialog.showMessageBox(win, { type: 'warning', message: msg.replace('{line}', line) });
+    return { success: false, code: 'edit_failed' };
+  }
+  addLog('success', on ? 'Discord app mode on: Discord updates through Shroudly'
+                       : 'Discord app mode off: Discord settings restored');
+  return { success: true };
+}
+
+ipcMain.handle('settings:set', async (e, key, value) => {
+  if (key === 'appMode') return setDiscordMode(value === true);
   store.set(key, value);
   if (ENGINE_SETTINGS.has(key)) scheduleEngineRestart();
   if (PROXY_SETTINGS.has(key)) scheduleProxyReapply();

@@ -19,6 +19,7 @@ const fs = require('fs');
 const SystemProxy = require('./system-proxy');
 const DohForwarder = require('./doh-forwarder');
 const diagnostics = require('./diagnostics');
+const UpdateRelay = require('./update-relay');
 
 const DEFAULT_PORT = 10808;
 
@@ -94,6 +95,8 @@ class EngineManager {
     this.lastProbe = null;
     this.proxyOptions = hooks.proxyOptions || {};
     this.proxy = new SystemProxy(this.log, this.proxyOptions);
+    // App mode: plain-HTTP front for Discord's TLS 1.2-only updater.
+    this.relay = new UpdateRelay(this.log, () => this.port);
     this.doh = new DohForwarder(this.log);
     this.dohPort = 0;
 
@@ -147,7 +150,24 @@ class EngineManager {
       routeMode: s.routeMode === 'listed' ? 'listed' : 'all',
       siteList: Array.isArray(s.siteList) ? s.siteList : DEFAULT_SITE_LIST,
       port: Number(s.listenPort || this.port) || DEFAULT_PORT,
+      appMode: s.appMode === true,
     };
+  }
+
+  /* The relay forwards through the engine's SOCKS port, so it lives and dies
+   * with the engine. A port conflict is logged, never fatal. */
+  /* Apply a changed appMode now, without waiting for an engine restart. */
+  async syncRelay() { if (this.active) await this._syncRelay(this._settings()); }
+
+  async _syncRelay(cfg) {
+    if (!cfg.appMode) { this.relay.stop(); return; }
+    if (this.relay.server) return;
+    try {
+      const p = await this.relay.start();
+      this.log('success', `Discord app mode: update relay on http://127.0.0.1:${p}/`);
+    } catch (e) {
+      this.log('error', `Discord app mode: update relay could not start (${e.message})`);
+    }
   }
 
   _args(cfg) {
@@ -197,6 +217,8 @@ class EngineManager {
       await this._cleanup();
       throw e;
     }
+
+    await this._syncRelay(cfg);
 
     this.active = true;
     this.startedAt = Date.now();
@@ -454,6 +476,7 @@ class EngineManager {
         throw new Error(this.lastError || 'Engine failed to restart');
       }
       this._startStatsPoll();
+      await this._syncRelay(cfg);
       this.log('success', `Settings applied (strategy: ${cfg.strategy}${cfg.autoProbe ? ' + auto' : ''})`);
       return { success: true };
     } finally {
@@ -479,6 +502,7 @@ class EngineManager {
     this.restarts = 0;
     this.startedAt = 0;
     this.doh.stop(); this.dohPort = 0;
+    this.relay.stop();
     this.store.set('runtimeActive', false);
     this.onStatusChange(false);
     this.log('success', 'Shroudly engine stopped; system restored');
@@ -512,6 +536,7 @@ class EngineManager {
     this._stopStatsPoll();
     if (this.proc) { try { this.proc.kill(); } catch {} this.proc = null; }
     this.doh.stop(); this.dohPort = 0;
+    this.relay.stop();
     try { await this.proxy.restore(); } catch {}
     this.active = false;
   }
