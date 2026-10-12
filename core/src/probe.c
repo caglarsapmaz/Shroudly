@@ -77,7 +77,7 @@ static int test_strategy(const char *host, const strategy *st, int use_doh) {
   if (chlen<0){sock_close(s);return 0;}
   proto_info pi; proto_inspect(ch,(size_t)chlen,&pi);
 
-  if (st) desync_send_first(s, fam, ch, chlen, &pi, st, NULL);
+  if (st) desync_send_first(s, fam, ch, chlen, (int)sizeof(ch), &pi, st, NULL);
   else sock_send_all(s, ch, (size_t)chlen, 0);
 
   int ok = 0;

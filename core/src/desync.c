@@ -30,49 +30,152 @@ static int resolve_pos(pos_ref ref, int offset, int len, const proto_info *pi) {
  * stream (the server would receive the scrambled decoy bytes in-band).
  */
 
+
+/* ── real out-of-order delivery, without raw sockets ─────────────────────
+ * The first half is sent with a TTL too small to cross the network, so it
+ * dies at an early hop; the second half then goes out normally and is what
+ * the filter sees first. The kernel retransmits the lost half a moment later
+ * with its original sequence numbers, so the server still receives a correct,
+ * in-order stream and nothing about the connection is malformed. A filter
+ * that reassembles TCP is defeated too, because it only ever saw the tail of
+ * the ClientHello before deciding. Costs one retransmit timeout on the
+ * connections that need it, and is never used on traffic that is not blocked.
+ */
+static int send_disordered(sock_t up, int family, const uint8_t *buf,
+                           int a, int mid, int b, int ttl) {
+  int saved = sock_get_ttl(up, family);
+  if (saved <= 0) saved = 64;           /* Windows defaults to 128, so read it */
+  if (ttl <= 0 || ttl > 8) ttl = 1;     /* 1 = dies at the first hop, which is all we need */
+  if (sock_set_ttl(up, family, ttl) != 0) {
+    /* No per-socket TTL control here: plain fragmentation still helps. */
+    if (sock_send_all(up, buf + a, (size_t)(mid - a), 0) != 0) return -1;
+    sock_wait_sent(up, 10);
+    return sock_send_all(up, buf + mid, (size_t)(b - mid), 0);
+  }
+  int rc = sock_send_all(up, buf + a, (size_t)(mid - a), 0);
+  /* The TTL must not be restored until this segment has actually been
+   * transmitted, or the kernel sends it with the restored TTL and the whole
+   * technique silently does nothing. Linux can be asked precisely; elsewhere a
+   * 10 ms pause is the established value. */
+  sock_wait_sent(up, 10);
+#ifndef __linux__
+  sleep_ms(10);
+#endif
+  sock_set_ttl(up, family, saved);          /* restore before the real half */
+  if (rc != 0) return -1;
+  return sock_send_all(up, buf + mid, (size_t)(b - mid), 0);
+}
+
+/* ── TLS record fragmentation ────────────────────────────────────────────
+ * One handshake record becomes two, split inside the server name. RFC 8446
+ * §5.1 lets a handshake message be fragmented across records, so every TLS
+ * server reassembles this correctly, but a filter that parses only the first
+ * record of a connection never sees a complete name. Unlike the TCP tricks it
+ * needs no control over timing or TTL, so it behaves identically on every
+ * operating system and survives middleboxes that normalise TCP.
+ *
+ * Done as an in-place rewrite rather than at send time, so that a strategy can
+ * combine it with splitting: the TCP-level cuts then apply to the re-framed
+ * bytes, which is the combination that several networks need.
+ * Returns the new length, or -1 if it does not apply. */
+static int tls_insert_record(uint8_t *buf, int len, int cap, int rec_total, int pos) {
+  if (len < 7 || buf[0] != 0x16) return -1;
+  if (len + 5 > cap) return -1;
+  int total = (rec_total > 0 && rec_total <= len) ? rec_total : len;
+  int body  = total - 5;
+  if (body < 2) return -1;
+  int n1 = pos - 5;                     /* bytes of body in the first record */
+  if (n1 < 1 || n1 >= body) n1 = body / 2;
+  int n2 = body - n1;
+  if (n1 < 1 || n2 < 1) return -1;
+
+  /* Open a five-byte gap for the second record header. */
+  memmove(buf + 5 + n1 + 5, buf + 5 + n1, (size_t)(len - (5 + n1)));
+  buf[3] = (uint8_t)((n1 >> 8) & 0xff); buf[4] = (uint8_t)(n1 & 0xff);
+  uint8_t *h = buf + 5 + n1;
+  h[0] = buf[0]; h[1] = buf[1]; h[2] = buf[2];
+  h[3] = (uint8_t)((n2 >> 8) & 0xff); h[4] = (uint8_t)(n2 & 0xff);
+  return len + 5;
+}
+
+/* ── out-of-band byte ────────────────────────────────────────────────────
+ * One byte of the payload is replaced and sent as TCP urgent data. The
+ * receiving stack removes the urgent byte from the stream, so the server
+ * reassembles the original request exactly; a filter that ignores the urgent
+ * pointer (almost all of them — RFC 6093 §3) keeps the byte and ends up with a
+ * corrupted server name. Placing it inside the SNI is the point. */
+static int send_oob_at(sock_t up, uint8_t *buf, int len, int pos) {
+  if (pos < 1 || pos >= len) return -2;
+  uint8_t saved = buf[pos];
+  buf[pos] = (uint8_t)'a';
+  int rc = sock_send_all(up, buf, (size_t)pos + 1, MSG_OOB);
+  buf[pos] = saved;
+  if (rc != 0) return -1;
+  sock_wait_sent(up, 10);
+  /* The urgent byte stood in for buf[pos], so the real stream resumes there. */
+  return sock_send_all(up, buf + pos, (size_t)(len - pos), 0);
+}
+
 int desync_send_first(sock_t up, int family,
-                      uint8_t *payload, int len,
+                      uint8_t *payload, int len, int cap,
                       const proto_info *pi, const strategy *st,
                       _Atomic uint64_t *desync_counter) {
   if (len <= 0) return 0;
-  (void)family; /* only used by the optional raw backend, not the stream path */
 
   /* Optional HTTP Host case-scramble. */
   for (int i = 0; i < st->n_ops; i++) {
     if (st->ops[i].kind == OP_HTTP_CASE && pi->kind == PROTO_HTTP && pi->http_hdr_off >= 0) {
-      /* "Host" -> "hOsT" in place */
       int o = pi->http_hdr_off;
       if (o + 4 <= len) { payload[o+1] = 'O'; payload[o+3] = 'T'; }
     }
   }
 
-  /* Collect split points from split/disorder ops, in order. */
-  int splits[MAX_OPS]; int nsplits = 0; int disorder = 0; int do_fake = 0;
+  /* Collect the TCP cut points first, from the untouched payload, so the
+   * positions still refer to the names the strategy was written against. */
+  int splits[MAX_OPS]; int nsplits = 0; int disorder = 0;
   for (int i = 0; i < st->n_ops; i++) {
     op_kind k = st->ops[i].kind;
-    if (k == OP_FAKE) do_fake = 1;
-    if (k == OP_SPLIT || k == OP_DISORDER) {
-      int p = resolve_pos(st->ops[i].ref, st->ops[i].offset, len, pi);
-      /* keep sorted & unique */
-      int dup = 0;
-      for (int j = 0; j < nsplits; j++) if (splits[j] == p) dup = 1;
-      if (!dup && nsplits < MAX_OPS) splits[nsplits++] = p;
-      if (k == OP_DISORDER) {
-        disorder = 1;
-        /* disorder implies extra fragmentation: add a second cut just before the
-         * marker so the SNI lands in its own middle fragment even in the
-         * userspace (flush-based) path. */
-        int p2 = p > 1 ? p - 1 : p + 1;
-        if (p2 > 0 && p2 < len) {
-          int d2 = 0;
-          for (int j = 0; j < nsplits; j++) if (splits[j] == p2) d2 = 1;
-          if (!d2 && nsplits < MAX_OPS) splits[nsplits++] = p2;
-        }
-      }
-    }
+    if (k != OP_SPLIT && k != OP_DISORDER) continue;
+    int p = resolve_pos(st->ops[i].ref, st->ops[i].offset, len, pi);
+    int dup = 0;
+    for (int j = 0; j < nsplits; j++) if (splits[j] == p) dup = 1;
+    if (!dup && nsplits < MAX_OPS) splits[nsplits++] = p;
+    if (k == OP_DISORDER) disorder = 1;
   }
-  /* simple insertion sort */
-  for (int i = 1; i < nsplits; i++) {
+
+  /* Re-frame the handshake, then move any cut that now sits after the inserted
+   * record header. */
+  for (int i = 0; i < st->n_ops; i++) {
+    if (st->ops[i].kind != OP_TLSREC || pi->kind != PROTO_TLS) continue;
+    int pos = resolve_pos(st->ops[i].ref, st->ops[i].offset, len, pi);
+    int nl = tls_insert_record(payload, len, cap, pi->tls_record_total, pos);
+    if (nl > 0) {
+      for (int j = 0; j < nsplits; j++) if (splits[j] > pos) splits[j] += 5;
+      len = nl;
+    }
+    break;
+  }
+
+  /* An out-of-band byte replaces one byte of the name; the receiving stack
+   * removes it again, so it is sent on its own rather than combined. */
+  for (int i = 0; i < st->n_ops; i++) {
+    if (st->ops[i].kind != OP_OOB) continue;
+    int pos = resolve_pos(st->ops[i].ref, st->ops[i].offset, len, pi);
+    int r = send_oob_at(up, payload, len, pos);
+    if (desync_counter) (*desync_counter)++;
+    if (r == 0) return 0;
+    if (r == -1) return -1;
+    break;
+  }
+
+  /* A "fake" op is accepted by the parser but has no effect here: a decoy
+   * segment must never reach the server, and TCP retransmits anything it has
+   * not had acknowledged, so suppressing it needs the packet layer (raw socket
+   * / NFQUEUE / WinDivert) or TCP_REPAIR. That is the optional advanced
+   * backend; the portable build relies on tlsrec, split and disorder, which
+   * between them defeat both stateless and reassembling filters. */
+
+  for (int i = 1; i < nsplits; i++) {   /* insertion sort, ascending */
     int v = splits[i], j = i - 1;
     while (j >= 0 && splits[j] > v) { splits[j+1] = splits[j]; j--; }
     splits[j+1] = v;
@@ -80,51 +183,31 @@ int desync_send_first(sock_t up, int family,
 
   if (desync_counter) (*desync_counter)++;
 
-  /* A "fake" op is accepted by the parser but has no effect in the portable
-   * userspace build: a real decoy packet must be injected out-of-band at the
-   * packet layer (raw socket / NFQUEUE / WinDivert), which is a platform backend
-   * left out of the driver-free default. See CAPABILITIES.md. We rely on
-   * split + disorder, which defeat stateless SNI/Host DPI. */
-  (void)do_fake;
-
-  if (nsplits == 0) {
-    return sock_send_all(up, payload, (size_t)len, 0);
-  }
-
-  /* Build segments [0,s0) [s0,s1) ... [sk,len). */
   int bounds[MAX_OPS + 2]; int nb = 0;
   bounds[nb++] = 0;
-  for (int i = 0; i < nsplits; i++) if (splits[i] > 0 && splits[i] < len) bounds[nb++] = splits[i];
+  for (int i = 0; i < nsplits; i++)
+    if (splits[i] > 0 && splits[i] < len) bounds[nb++] = splits[i];
   bounds[nb++] = len;
 
-  /* IMPORTANT: over a userspace TCP stream we cannot truly reorder segments —
-   * the kernel always transmits them in ascending sequence order, so sending a
-   * later chunk "first" with send() does not put it on the wire first. True
-   * out-of-order injection needs raw sockets (optional SHROUDLY_RAW build).
-   *
-   * What *does* reliably defeat stateless SNI/Host DPI here is fragmentation:
-   * forcing the ClientHello onto the wire as multiple small segments (with a
-   * flush between them) so the SNI never appears whole in one segment. So in the
-   * userspace path we always send in order with per-segment flushes, and treat
-   * "disorder" as a request for an extra early fragment to maximise splitting. */
-#ifdef SHROUDLY_RAW
-  if (disorder && nb >= 3) {
-    for (int i = nb - 2; i >= 0; i--) {
-      int a = bounds[i], b = bounds[i+1];
-      if (b > a) {
-        if (sock_send_all(up, payload + a, (size_t)(b - a), 0) != 0) return -1;
+  if (nb <= 2) return sock_send_all(up, payload, (size_t)len, 0);
+
+  if (disorder) {
+    if (send_disordered(up, family, payload, bounds[0], bounds[1], bounds[2],
+                        st->fake_ttl) != 0) return -1;
+    for (int i = 2; i + 1 < nb; i++) {
+      if (bounds[i+1] > bounds[i]) {
         sock_wait_sent(up, 10);
+        if (sock_send_all(up, payload + bounds[i],
+                          (size_t)(bounds[i+1] - bounds[i]), 0) != 0) return -1;
       }
     }
     return 0;
   }
-#else
-  (void)disorder;
-#endif
+
   for (int i = 0; i + 1 < nb; i++) {
-    int a = bounds[i], b = bounds[i+1];
-    if (b > a) {
-      if (sock_send_all(up, payload + a, (size_t)(b - a), 0) != 0) return -1;
+    if (bounds[i+1] > bounds[i]) {
+      if (sock_send_all(up, payload + bounds[i],
+                        (size_t)(bounds[i+1] - bounds[i]), 0) != 0) return -1;
       sock_wait_sent(up, 10);
     }
   }

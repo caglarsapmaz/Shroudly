@@ -18,18 +18,47 @@ const path = require('path');
 const fs = require('fs');
 const SystemProxy = require('./system-proxy');
 const DohForwarder = require('./doh-forwarder');
+const diagnostics = require('./diagnostics');
 
 const DEFAULT_PORT = 10808;
 
-// Domains routed through the proxy in "listed" mode (default). Commonly blocked
-// in Turkey and similar; users can edit the list in Settings.
+// Domains routed through the proxy in "listed" mode. Services that are widely
+// blocked somewhere, together with the CDN domains they load their images and
+// media from — a site whose CDN is left out loads as a page of broken images,
+// which is worse than not routing it at all. Only lawful services are listed.
+// The default routing mode sends everything through Shroudly instead, so this
+// list only matters to people who narrow it down; they can edit it in Settings.
 const DEFAULT_SITE_LIST = [
+  // Discord
   'discord.com', 'discord.gg', 'discordapp.com', 'discordapp.net', 'discord.media',
   'discordcdn.com', 'discord.dev', 'discordstatus.com',
-  'roblox.com', 'rbxcdn.com', 'roblox.cash',
-  'wattpad.com', 'pastebin.com',
-  'medium.com', 'imgur.com',
-  'soundcloud.com', 'onlyfans.com',
+  // Roblox
+  'roblox.com', 'rbxcdn.com', 'robloxlabs.com',
+  // Reading / writing / sharing
+  'wattpad.com', 'pastebin.com', 'medium.com', 'imgur.com', 'linktr.ee',
+  'archiveofourown.org', 'tumblr.com', 'wordpress.com', 'blogspot.com',
+  'quora.com', 'deviantart.com', 'flickr.com', 'pinterest.com',
+  // Audio / video
+  'soundcloud.com', 'sndcdn.com', 'spotify.com', 'scdn.co',
+  'youtube.com', 'youtu.be', 'ytimg.com', 'googlevideo.com',
+  'twitch.tv', 'ttvnw.net', 'jtvnw.net', 'vimeo.com', 'vimeocdn.com',
+  'dailymotion.com', 'dmcdn.net',
+  // Social
+  'x.com', 'twitter.com', 'twimg.com', 't.co',
+  'facebook.com', 'fbcdn.net', 'instagram.com', 'cdninstagram.com',
+  'whatsapp.com', 'whatsapp.net',
+  'tiktok.com', 'tiktokcdn.com', 'tiktokv.com',
+  'reddit.com', 'redd.it', 'redditstatic.com', 'redditmedia.com',
+  'telegram.org', 'telegram.me', 't.me', 'signal.org',
+  // Reference and news
+  'wikipedia.org', 'wikimedia.org', 'archive.org',
+  'bbc.com', 'bbc.co.uk', 'dw.com', 'voanews.com', 'rferl.org',
+  'reuters.com', 'theguardian.com', 'nytimes.com',
+  'eksisozluk.com',
+  // Tools developers and students lose first
+  'github.com', 'githubusercontent.com', 'githubassets.com', 'gitlab.com',
+  'stackoverflow.com', 'stackexchange.com', 'sstatic.net',
+  'duckduckgo.com', 'proton.me', 'protonmail.com', 'tutanota.com', 'torproject.org',
 ];
 const MAX_RESTARTS = 5;
 // No output at all for this long, although STATS is asked every second, means
@@ -68,6 +97,10 @@ class EngineManager {
 
     this.proc = null;
     this.active = false;
+    // Hosts we have already reported on, so a busy page logs one line per site
+    // rather than one per connection.
+    this.bypassed = new Set();
+    this.blockedHosts = new Set();
     this.port = Number(store.get('listenPort', DEFAULT_PORT)) || DEFAULT_PORT;
     this.expectingStop = false;
     this.restarts = 0;
@@ -103,7 +136,12 @@ class EngineManager {
       autoProbe: s.autoMode !== false,          // "auto mode" now means real auto-probe
       useDoh: s.dnsProtection !== false,        // encrypted DNS: default on
       preferIpv6: s.preferIpv6 === true,
-      routeMode: s.routeMode === 'all' ? 'all' : 'listed',   // default: listed sites only
+      // Default: everything goes through Shroudly. That is what makes a blocked
+      // site work without anyone having to know its name in advance, and it is
+      // what gives every lookup our encrypted DNS. It costs nothing, because the
+      // engine leaves a connection completely untouched unless it is refused:
+      // ordinary browsing is relayed as-is, at the same speed as no proxy.
+      routeMode: s.routeMode === 'listed' ? 'listed' : 'all',
       siteList: Array.isArray(s.siteList) ? s.siteList : DEFAULT_SITE_LIST,
       port: Number(s.listenPort || this.port) || DEFAULT_PORT,
     };
@@ -130,6 +168,9 @@ class EngineManager {
     const cfg = this._settings();
     this.port = cfg.port;
     this.stats = this._empty();
+    this.bypassed.clear();
+    this.blockedHosts.clear();
+    this._describeEnvironment();
     this.stats.strategy = cfg.strategy;
     this.expectingStop = false;
 
@@ -203,6 +244,40 @@ class EngineManager {
     });
   }
 
+  /* Write down what this machine looks like, and act on the two findings that
+   * change the outcome: another tool steering the same traffic, and a resolver
+   * handing back forged answers. Runs in the background so it never delays the
+   * engine coming up. */
+  async _describeEnvironment() {
+    let d;
+    try { d = await diagnostics.collect(); } catch { return; }
+
+    const net = `${d.iface.name} (${d.iface.kind})`;
+    const dnsList = d.dnsServers.length ? d.dnsServers.join(', ') : 'unknown';
+    this.log('info', `System: ${d.os} — network ${net}, DNS ${dnsList}`);
+
+    if (d.conflicts.length) {
+      // Two tools rewriting the same connections is the most common reason a
+      // working setup stops working, so say it plainly and name them.
+      this.log('warning', `Also running: ${d.conflicts.join(', ')}. Another bypass tool or VPN changes the same connections as Shroudly; if sites misbehave, turn one of them off.`);
+      if (typeof this.onConflicts === 'function') this.onConflicts(d.conflicts);
+    }
+
+    if (d.forgedDns.length) {
+      const names = d.forgedDns.map((h) => h.host).join(', ');
+      if (this.store.get('dnsProtection') === false) {
+        // The user switched it off and their network is poisoning DNS: turn it
+        // back on rather than let every lookup fail.
+        this.store.set('dnsProtection', true);
+        this.log('warning', `Your DNS is being tampered with (${names}). Encrypted DNS has been switched back on automatically.`);
+        if (this.active) this.restart().catch(() => {});
+      } else {
+        this.log('info', `Your provider's DNS returns forged answers for ${names}; Shroudly's encrypted DNS is handling it.`);
+      }
+      if (typeof this.onDnsTampering === 'function') this.onDnsTampering(d.forgedDns);
+    }
+  }
+
   _onLine(line, finishStart) {
     let msg;
     try { msg = JSON.parse(line); } catch { this.log('info', `engine: ${line}`); return; }
@@ -222,6 +297,25 @@ class EngineManager {
         this.stats.probeOk = msg.probe_ok;
         this.stats.probeFail = msg.probe_fail;
         this.stats.sampledAt = Date.now(); // lets the UI compute rates per sample
+        break;
+      // A site that needed a technique, and one that defeated all of them. These
+      // two lines are what makes a user's log enough to diagnose a report: the
+      // site, the technique that worked, and how many had to be tried.
+      case 'bypass':
+        this.blockedHosts.delete(msg.host);
+        if (!this.bypassed.has(msg.host)) {
+          this.bypassed.add(msg.host);
+          this.log('success', `${msg.host}: blocked here, opened with ${msg.strategy} (${msg.attempts} tries, ${msg.family})`);
+        }
+        break;
+      case 'blocked':
+        if (!this.blockedHosts.has(msg.host)) {
+          this.blockedHosts.add(msg.host);
+          this.log('warning', `${msg.host}: still blocked after ${msg.attempts} techniques (${msg.family}) — this network may need Advanced mode`);
+        }
+        break;
+      case 'send_failed':
+        this.log('warning', `${msg.host}: connection dropped while sending (${msg.family})`);
         break;
       case 'probe':
         if (msg.ok && msg.strategy === 'none') {

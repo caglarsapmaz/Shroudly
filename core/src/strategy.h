@@ -14,6 +14,7 @@ typedef enum {
   OP_DISORDER,     /* like split but send the 2nd part first      */
   OP_FAKE,         /* send a decoy packet (low TTL / bad data) before the real one */
   OP_HTTP_CASE,    /* rewrite Host -> hOsT for plain HTTP          */
+  OP_TLSREC,       /* re-frame the ClientHello as two TLS records   */
   OP_OOB           /* reserved */
 } op_kind;
 

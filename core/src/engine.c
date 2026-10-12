@@ -12,6 +12,29 @@
 #define FIRST_WAIT  4000   /* ms to gather the client's first payload */
 #define MAX_CONNS   2048   /* hard cap on concurrent connections (loopback) */
 
+/* ── attempt ladder ──────────────────────────────────────────────────────
+ * A censored connection must never reach the browser as an error page. The
+ * client's first payload is buffered, so when the filter kills an attempt we
+ * can open a fresh connection and replay it with a different desync — the
+ * browser only ever sees the attempt that worked. This is what removes the
+ * "failed once, works when I reload" behaviour.
+ *
+ * The first attempt for an unknown host is deliberately PLAIN: a site that is
+ * not blocked answers immediately and is then relayed untouched, so ordinary
+ * browsing carries no desync, no risk and no added latency. Only when that
+ * attempt is refused do we start trying desync strategies, and the one that
+ * works is remembered per host, so the cost is paid once. */
+#define ATT_PLAIN      (-2)    /* send the payload unmodified */
+#define ATT_MAX         6
+#define ATT_BUDGET_MS   15000
+#define VERIFY_PLAIN_MS 2500
+#define VERIFY_DESYNC_MS 3500
+
+/* Outcome of one attempt. */
+#define ATT_OK      1   /* server answered */
+#define ATT_REFUSED 0   /* reset / closed / silence: looks like filtering */
+#define ATT_LOCAL  (-1) /* our own send failed */
+
 static engine_config  g_cfg;
 static engine_stats   g_stats;
 static sock_t         g_listener = SOCK_INVALID;
@@ -216,25 +239,100 @@ static int read_first(sock_t c, uint8_t *buf, int cap) {
 
 typedef struct { sock_t client; } conn_arg;
 
+/* Replaying a payload must be harmless. A TLS ClientHello always is; for HTTP
+ * only idempotent methods qualify, so a POST is never sent twice. */
+static int retry_safe(const proto_info *pi, const uint8_t *b, int len) {
+  if (pi->kind == PROTO_TLS) return 1;
+  if (pi->kind == PROTO_HTTP && len >= 5)
+    return memcmp(b, "GET ", 4) == 0 || memcmp(b, "HEAD ", 5) == 0;
+  return 0;
+}
+
+/* One line of JSON per interesting event, read by the app and written to the
+ * log the user can send us. Hosts are reported because the user asked for the
+ * site, but nothing is sent anywhere: it only reaches the local log file. */
+static void report(const char *ev, const char *host, const char *strat,
+                   int attempts, int fam) {
+  printf("{\"type\":\"%s\",\"host\":\"%s\",\"strategy\":\"%s\","
+         "\"attempts\":%d,\"family\":\"%s\"}\n",
+         ev, host, strat ? strat : "", attempts, fam == AF_INET6 ? "ipv6" : "ipv4");
+  fflush(stdout);
+}
+
+/* The filter can answer *instead* of the server: an injected block page, a
+ * forged handshake, or a plaintext redirect. So bytes arriving is not proof
+ * that an attempt worked — when we sent a ClientHello the reply has to be a
+ * real TLS handshake record, and a ServerHello if it is a handshake at all.
+ * Without this check a block page counts as success and gets cached. */
+static int tls_reply_ok(const uint8_t *b, int n) {
+  if (n < 1) return 0;
+  if (b[0] < 0x14 || b[0] > 0x18) return 0;      /* not a TLS record type */
+  if (n < 2) return 1;
+  if (b[1] != 0x03) return 0;                    /* legacy record version */
+  if (b[0] == 0x16 && n >= 6 && b[5] != 0x02) return 0;  /* handshake, not ServerHello */
+  return 1;
+}
+
+/* Send the first payload using `preset` (or unmodified for ATT_PLAIN), then
+ * wait for the server to say something. On success the server's first bytes
+ * are left in `rbuf` and their length stored in `*rlen`. */
+static int attempt(sock_t up, int fam, uint8_t *payload, int len,
+                   const proto_info *pi, int preset, int wait_ms,
+                   uint8_t *rbuf, int rcap, int *rlen) {
+  *rlen = 0;
+  if (preset == ATT_PLAIN || pi->kind == PROTO_UNKNOWN) {
+    if (sock_send_all(up, payload, (size_t)len, 0) != 0) return ATT_LOCAL;
+  } else {
+    const strategy *st = (preset >= 0) ? strategy_preset(preset) : &g_cfg.strat;
+    if (desync_send_first(up, fam, payload, len, rcap, pi, st, &g_stats.desync_applied) != 0)
+      return ATT_LOCAL;
+  }
+  atomic_fetch_add(&g_stats.bytes_up, (uint64_t)len);
+
+  int w = sock_wait_readable(up, wait_ms);
+  if (w < 0) return ATT_REFUSED;
+  if (w == 0) return ATT_REFUSED;        /* blackholed */
+  int n = recv(up, (char *)rbuf, rcap, 0);
+  if (n <= 0) return ATT_REFUSED;        /* RST or FIN injected by the filter */
+
+  if (pi->kind == PROTO_TLS) {
+    /* Top up to the first six bytes so the record header can be judged. */
+    while (n < 6 && n < rcap && sock_wait_readable(up, 400) == 1) {
+      int m = recv(up, (char *)rbuf + n, rcap - n, 0);
+      if (m <= 0) break;
+      n += m;
+    }
+    if (!tls_reply_ok(rbuf, n)) return ATT_REFUSED;
+  }
+  *rlen = n;
+  return ATT_OK;
+}
+
 static void handle(sock_t client) {
   atomic_fetch_add(&g_stats.conns_total, 1);
   atomic_fetch_add(&g_stats.conns_active, 1);
 
   char host[256]; uint16_t port; int is_ip6 = 0;
+  uint8_t *first = NULL, *work = NULL, *rbuf = NULL;
+  sock_t up = SOCK_INVALID;
+
   sock_set_timeouts(client, 30000);
   sock_set_nodelay(client, 1);
 
   if (socks5_accept(client, host, sizeof(host), &port, &is_ip6) != 0) goto done;
 
   int fam = 0;
-  sock_t up = dial(host, port, g_cfg.prefer_ipv6, &fam);
+  up = dial(host, port, g_cfg.prefer_ipv6, &fam);
   if (up == SOCK_INVALID) { socks5_reply(client, 0x04); goto done; }
-  if (socks5_reply(client, 0x00) != 0) { sock_close(up); goto done; }
+  if (socks5_reply(client, 0x00) != 0) goto done;
 
-  /* First payload */
-  uint8_t *first = (uint8_t *)malloc(RELAY_BUF);
-  if (!first) { sock_close(up); goto done; }
+  first = (uint8_t *)malloc(RELAY_BUF);
+  work  = (uint8_t *)malloc(RELAY_BUF);
+  rbuf  = (uint8_t *)malloc(RELAY_BUF);
+  if (!first || !work || !rbuf) goto done;
+
   int flen = read_first(client, first, RELAY_BUF);
+  int rlen = 0;
 
   if (flen > 0) {
     proto_info pi;
@@ -242,28 +340,77 @@ static void handle(sock_t client) {
     if (pi.kind == PROTO_TLS)  atomic_fetch_add(&g_stats.tls_seen, 1);
     if (pi.kind == PROTO_HTTP) atomic_fetch_add(&g_stats.http_seen, 1);
 
-    const strategy *st = &g_cfg.strat;
-    int preset = -1;
-    if (g_cfg.auto_probe && pi.kind != PROTO_UNKNOWN) {
-      preset = hs_get(pi.host[0] ? pi.host : host);
-      if (preset >= 0) st = strategy_preset(preset);
+    const char *key = pi.host[0] ? pi.host : host;
+
+    /* Build the ladder. */
+    int cand[ATT_MAX]; int ncand = 0;
+    int ladder = g_cfg.auto_probe && pi.kind != PROTO_UNKNOWN &&
+                 retry_safe(&pi, first, flen);
+    if (!ladder) {
+      cand[ncand++] = g_cfg.auto_probe ? ATT_PLAIN : -1;   /* -1 = configured */
+    } else {
+      int learned = hs_get(key);
+      if (learned >= 0) cand[ncand++] = learned;           /* known to work */
+      else              cand[ncand++] = ATT_PLAIN;         /* untouched first */
+      int np = strategy_preset_count();
+      for (int i = 0; i < np && ncand < ATT_MAX; i++) {
+        if (i == learned) continue;
+        cand[ncand++] = i;
+      }
+      /* If a strategy was learned, still allow an untouched attempt last: the
+       * block may have been lifted, or the host may have changed. */
+      if (learned >= 0 && ncand < ATT_MAX) cand[ncand++] = ATT_PLAIN;
     }
 
-    /* Apply desync to the first payload; plain passthrough if unknown proto. */
-    if (pi.kind != PROTO_UNKNOWN) {
-      desync_send_first(up, fam, first, flen, &pi, st, &g_stats.desync_applied);
-      atomic_fetch_add(&g_stats.bytes_up, (uint64_t)flen);
-    } else {
-      sock_send_all(up, first, (size_t)flen, 0);
-      atomic_fetch_add(&g_stats.bytes_up, (uint64_t)flen);
+    uint64_t deadline = now_ms() + ATT_BUDGET_MS;
+    for (int a = 0; a < ncand; a++) {
+      if (a > 0) {
+        /* Anything the client sent meanwhile belongs in the replay. */
+        while (flen < RELAY_BUF && sock_wait_readable(client, 0) == 1) {
+          int n = recv(client, (char *)first + flen, RELAY_BUF - flen, 0);
+          if (n <= 0) break;
+          flen += n;
+        }
+        sock_close(up);
+        up = dial(host, port, g_cfg.prefer_ipv6, &fam);
+        if (up == SOCK_INVALID) break;
+      }
+      memcpy(work, first, (size_t)flen);   /* strategies may rewrite in place */
+      int wait_ms = (cand[a] == ATT_PLAIN) ? VERIFY_PLAIN_MS : VERIFY_DESYNC_MS;
+      int r = attempt(up, fam, work, flen, &pi, cand[a], wait_ms, rbuf, RELAY_BUF, &rlen);
+      if (r == ATT_OK) {
+        if (ladder && cand[a] >= 0) hs_put(key, cand[a]);
+        atomic_fetch_add(&g_stats.probe_success, 1);
+        /* Only worth reporting when something had to be done about it: a site
+         * that opened untouched is not news, one that needed a technique is. */
+        if (a > 0 && cand[a] >= 0)
+          report("bypass", key, strategy_preset(cand[a])->name, a + 1, fam);
+        break;
+      }
+      if (r == ATT_LOCAL || !ladder) {
+        if (r == ATT_LOCAL) report("send_failed", key, "", a + 1, fam);
+        break;
+      }
+      atomic_fetch_add(&g_stats.probe_fail, 1);
+      if (a + 1 >= ncand || now_ms() >= deadline) {
+        /* Nothing got through. This line is what a support log needs: the host,
+         * how many techniques were tried, and which address family was used. */
+        report("blocked", key, "", a + 1, fam);
+        break;
+      }
     }
   }
-  free(first);
 
+  if (up == SOCK_INVALID) goto done;
+  if (rlen > 0) {
+    if (sock_send_all(client, rbuf, (size_t)rlen, 0) != 0) goto done;
+    atomic_fetch_add(&g_stats.bytes_down, (uint64_t)rlen);
+  }
   relay(client, up);
-  sock_close(up);
 
 done:
+  if (up != SOCK_INVALID) sock_close(up);
+  free(first); free(work); free(rbuf);
   atomic_fetch_sub(&g_stats.conns_active, 1);
   sock_close(client);
 }

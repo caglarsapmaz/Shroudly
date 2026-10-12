@@ -63,7 +63,7 @@ static void run_case(const char *spec, const char *host){
   CHECK(pi.kind==PROTO_TLS);
   CHECK(pi.host_off>0);
 
-  int r=desync_send_first(up,AF_INET,ch,clen,&pi,&st,NULL);
+  int r=desync_send_first(up,AF_INET,ch,clen,(int)sizeof(ch),&pi,&st,NULL);
   CHECK(r==0);
   sock_close(up);
   sleep_ms(150);

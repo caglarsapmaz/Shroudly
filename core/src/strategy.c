@@ -53,6 +53,8 @@ int strategy_parse(const char *spec, strategy *out) {
     else if (strcmp(tok, "disorder") == 0) op.kind = OP_DISORDER;
     else if (strcmp(tok, "fake") == 0)     op.kind = OP_FAKE;
     else if (strcmp(tok, "httpcase") == 0) op.kind = OP_HTTP_CASE;
+    else if (strcmp(tok, "tlsrec") == 0)   op.kind = OP_TLSREC;
+    else if (strcmp(tok, "oob") == 0)      op.kind = OP_OOB;
     else continue;
 
     if (op.kind == OP_FAKE) {
@@ -61,6 +63,9 @@ int strategy_parse(const char *spec, strategy *out) {
       if (strstr(args, "badsum")) out->fmode = FAKE_BADSUM;
       op.ref = POS_SNI;
       op.offset = 0;
+    } else if (op.kind == OP_TLSREC || op.kind == OP_OOB) {
+      op.ref = parse_ref(args, &op.offset);
+      if (op.ref == POS_ABS && args[0]) op.offset = atoi(args);
     } else if (op.kind == OP_SPLIT || op.kind == OP_DISORDER) {
       op.ref = parse_ref(args, &op.offset);
       if (op.ref == POS_ABS && args[0]) out->split_pos = atoi(args);
@@ -72,7 +77,7 @@ int strategy_parse(const char *spec, strategy *out) {
 
 /* Presets ordered most-universal first. These mirror the techniques that work
  * against real-world DPI (split at SNI, disorder, fakes at low TTL). */
-static strategy PRESETS[12];
+static strategy PRESETS[20];
 static int N_PRESETS = 0;
 
 static void add(const char *name, const char *spec) {
@@ -84,13 +89,36 @@ static void add(const char *name, const char *spec) {
 
 static void ensure_presets(void) {
   if (N_PRESETS) return;
-  /* Relay-safe desyncs first (split/disorder); fake(...) variants are only
-   * active in the optional raw-socket build and are listed after. */
+  /* Ordered by how much of the world each one opens, cheapest first. The engine
+   * walks this list when a connection is refused, so the entries that work
+   * nearly everywhere come before the ones that only help a few networks.
+   *
+   * What each technique is for:
+   *   tlsrec   — the handshake is re-framed as two TLS records (legal: RFC 8446
+   *              §5.1). Beats filters that reassemble TCP, which plain splitting
+   *              cannot, and costs nothing because it needs no timing or TTL.
+   *   split    — the ClientHello leaves as several TCP segments.
+   *   disorder — the halves genuinely arrive out of order (see desync.c).
+   *   oob      — one byte goes as TCP urgent data; the server drops it from the
+   *              stream, a filter that ignores the urgent pointer does not.
+   *
+   * The combined entries are the ones Turkish users have converged on across
+   * several independent projects (split + disorder + tlsrec together), which
+   * matches what we measured: a filter that reassembles TCP defeats split on
+   * its own but not tlsrec, while some networks need the record split placed
+   * slightly inside the name rather than at its start. */
+  add("tlsrec-sni",           "tlsrec(sni+1)");
+  add("split-tlsrec",         "split(1),tlsrec(sni+1)");
+  add("split-disorder-tlsrec","split(1),disorder(sni+3),tlsrec(sni+1)");
+  add("disorder-tlsrec",      "disorder(sni+1),tlsrec(sni+1)");
+  add("tlsrec-sni-mid",       "tlsrec(sni_mid)");
   add("split-sni",            "split(sni)");
   add("disorder-sni",         "disorder(sni)");
+  add("oob-tlsrec",           "oob(sni+1),tlsrec(sni+1)");
+  add("oob-sni",              "oob(sni+1)");
   add("split-sni-mid",        "split(sni_mid)");
   add("disorder-sni-mid",     "disorder(sni_mid)");
-  add("double-split",         "split(1),split(sni)");
+  add("split-disorder",       "split(1),disorder(sni)");
   add("split2",               "split(2)");
   add("disorder2",            "disorder(2)");
   add("split-sni-end",        "split(sni_end)");

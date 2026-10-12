@@ -8,6 +8,7 @@ import LogsPanel from '../components/LogsPanel';
 import StatsPanel from '../components/StatsPanel';
 import InfoPanel from '../components/InfoPanel';
 import UpdateBanner from '../components/UpdateBanner';
+import Onboarding from '../components/Onboarding';
 import { ChartIcon, InfoIcon, LogsIcon, SettingsIcon, ShieldIcon } from '../components/icons';
 import { useLanguage } from '../contexts/LanguageContext';
 
@@ -116,6 +117,8 @@ export default function Home() {
           <span className="truncate">{active ? t('active') : t('inactive')}</span>
         </span>
       </header>
+
+      <Onboarding />
 
       <UpdateBanner />
 

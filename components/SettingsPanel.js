@@ -140,7 +140,7 @@ export default function SettingsPanel({ active = false }) {
   const testingRef = useRef(null);
   const timeoutRef = useRef(null);
   const [settings, setSettings] = useState({
-    strategyId: 'auto', autoMode: true, dnsProtection: true, preferIpv6: false, routeMode: 'listed',
+    strategyId: 'auto', autoMode: true, dnsProtection: true, preferIpv6: false, routeMode: 'all',
     autoStart: false, minimizeToTray: true, showNotifications: true,
   });
   // null while unknown; false greys out "Prefer IPv6" on IPv4-only networks
@@ -318,7 +318,7 @@ export default function SettingsPanel({ active = false }) {
       {/* Routing: which sites go through Shroudly */}
       <Section title={t('routing')} Icon={GlobeIcon}>
         <Select
-          value={settings.routeMode === 'all' ? 'all' : 'listed'}
+          value={settings.routeMode === 'listed' ? 'listed' : 'all'}
           options={[
             { value: 'listed', label: t('routeListed') },
             { value: 'all', label: t('routeAll') },
@@ -326,10 +326,10 @@ export default function SettingsPanel({ active = false }) {
           onChange={(v) => save('routeMode', v)}
         />
         <p className="mt-2 text-[12px] leading-snug" style={{ color: 'var(--text-faint)' }}>
-          {settings.routeMode === 'all' ? t('routeAllDesc') : t('routeListedDesc')}
+          {settings.routeMode === 'listed' ? t('routeListedDesc') : t('routeAllDesc')}
         </p>
 
-        {settings.routeMode !== 'all' && (
+        {settings.routeMode === 'listed' && (
           <div className="mt-3">
             <div className="mb-1.5 flex items-center justify-between gap-2">
               <span className="text-[12px] font-medium" style={{ color: 'var(--text-faint)' }}>{t('siteListLabel')}</span>

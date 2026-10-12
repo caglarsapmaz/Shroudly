@@ -14,6 +14,16 @@
  * explicitly against the presented certificate (tls does not verify identity
  * when servername is empty).
  *
+ * Speed matters as much as privacy here: a DNS lookup that takes too long is
+ * indistinguishable from a broken one, and the engine would fall back to plain
+ * UDP resolvers, which are exactly what the censor poisons. So:
+ *   - every upstream keeps a pooled TLS connection open (no handshake per query)
+ *   - the connections are opened at startup and kept warm, so the first real
+ *     lookup is as fast as the hundredth
+ *   - upstreams are raced rather than chained: the preferred one goes first and
+ *     the others join 300 ms later, so one slow resolver cannot stall a lookup
+ *   - answers are cached for their TTL, so repeat lookups cost nothing
+ *
  * Nothing is logged or stored: a query comes in, a DoH request goes out, the
  * answer goes back.
  */
@@ -22,14 +32,28 @@ const dgram = require('dgram');
 const https = require('https');
 const tls = require('tls');
 
-// Upstreams by IP, with the cert names we accept for that IP. Tried in order;
-// a slow or blocked one falls through to the next.
+// Upstreams by IP, with the cert names we accept for that IP.
 const UPSTREAMS = [
   { ip: '1.1.1.1', names: ['cloudflare-dns.com', '1.1.1.1', 'one.one.one.one'] },
   { ip: '9.9.9.9', names: ['dns.quad9.net', '9.9.9.9'] },
   { ip: '8.8.8.8', names: ['dns.google', '8.8.8.8'] },
 ];
-const UPSTREAM_TIMEOUT_MS = 4000;
+
+const QUERY_TIMEOUT_MS = 2500;  // per upstream; they are raced, not chained
+const FANOUT_DELAY_MS  = 300;   // how long the preferred upstream gets alone
+const WARM_INTERVAL_MS = 120000;
+const CACHE_MAX        = 1500;
+const TTL_MIN_S        = 20;
+const TTL_MAX_S        = 3600;
+
+for (const up of UPSTREAMS) {
+  up.agent = new https.Agent({
+    keepAlive: true,
+    keepAliveMsecs: 30000,
+    maxSockets: 8,
+    maxFreeSockets: 2,
+  });
+}
 
 function certCoversIp(cert, ip) {
   // subjectaltname like "DNS:cloudflare-dns.com, IP Address:1.1.1.1"
@@ -46,6 +70,7 @@ function queryUpstream(up, dnsMsg) {
       port: 443,
       path: '/dns-query',
       method: 'POST',
+      agent: up.agent,
       headers: {
         'content-type': 'application/dns-message',
         accept: 'application/dns-message',
@@ -59,7 +84,7 @@ function queryUpstream(up, dnsMsg) {
         try { return tls.checkServerIdentity(up.names[0], cert); }
         catch (e) { return e; }
       },
-      timeout: UPSTREAM_TIMEOUT_MS,
+      timeout: QUERY_TIMEOUT_MS,
     }, (res) => {
       if (res.statusCode !== 200) { res.resume(); reject(new Error(`HTTP ${res.statusCode}`)); return; }
       const chunks = [];
@@ -73,12 +98,57 @@ function queryUpstream(up, dnsMsg) {
   });
 }
 
-async function resolveDoH(dnsMsg) {
-  let lastErr;
-  for (const up of UPSTREAMS) {
-    try { return await queryUpstream(up, dnsMsg); } catch (e) { lastErr = e; }
-  }
-  throw lastErr || new Error('all upstreams failed');
+/* ── DNS message helpers ───────────────────────────────────────────────── */
+
+// Question name + type, used as the cache key. Returns null if unparseable.
+function questionKey(msg) {
+  try {
+    if (msg.length < 13 || ((msg[2] >> 3) & 0x0f) !== 0) return null; // standard query only
+    if (msg.readUInt16BE(4) !== 1) return null;                       // exactly one question
+    let p = 12;
+    const parts = [];
+    while (p < msg.length) {
+      const len = msg[p];
+      if (len === 0) { p += 1; break; }
+      if (len & 0xc0) return null;            // no compression in a question
+      parts.push(msg.toString('latin1', p + 1, p + 1 + len).toLowerCase());
+      p += 1 + len;
+    }
+    if (p + 4 > msg.length) return null;
+    return `${parts.join('.')}|${msg.readUInt16BE(p)}`;   // name|qtype
+  } catch { return null; }
+}
+
+// Smallest TTL in the answer, so the cache expires when DNS says it should.
+function answerTtlSeconds(msg) {
+  try {
+    if (msg.length < 12) return null;
+    if ((msg[3] & 0x0f) !== 0) return null;          // only cache RCODE 0
+    const qd = msg.readUInt16BE(4), an = msg.readUInt16BE(6);
+    if (an === 0) return null;
+    let p = 12;
+    const skipName = () => {
+      while (p < msg.length) {
+        const len = msg[p];
+        if (len === 0) { p += 1; return true; }
+        if (len & 0xc0) { p += 2; return true; }     // compression pointer
+        p += 1 + len;
+      }
+      return false;
+    };
+    for (let i = 0; i < qd; i++) { if (!skipName()) return null; p += 4; }
+    let min = Infinity;
+    for (let i = 0; i < an; i++) {
+      if (!skipName()) return null;
+      if (p + 10 > msg.length) return null;
+      const ttl = msg.readUInt32BE(p + 4);
+      const rdlen = msg.readUInt16BE(p + 8);
+      p += 10 + rdlen;
+      if (ttl < min) min = ttl;
+    }
+    if (!isFinite(min)) return null;
+    return Math.max(TTL_MIN_S, Math.min(TTL_MAX_S, min));
+  } catch { return null; }
 }
 
 class DohForwarder {
@@ -86,6 +156,75 @@ class DohForwarder {
     this.log = log || (() => {});
     this.sock = null;
     this.port = 0;
+    this.preferred = 0;
+    this.cache = new Map();     // key -> { answer: Buffer, expires: ms }
+    this.warmTimer = null;
+    this.stopped = false;
+  }
+
+  /* Race the upstreams: the preferred one starts immediately, the rest join
+   * after a short delay. The first valid answer wins and becomes preferred. */
+  resolve(dnsMsg) {
+    return new Promise((resolve, reject) => {
+      const order = [this.preferred, ...UPSTREAMS.map((_, i) => i).filter((i) => i !== this.preferred)];
+      let settled = false, pending = 0, started = 0, lastErr = null, timer = null;
+
+      const done = (err, ans, idx) => {
+        if (settled) return;
+        if (!err) {
+          settled = true;
+          clearTimeout(timer);
+          this.preferred = idx;
+          resolve(ans);
+          return;
+        }
+        lastErr = err;
+        if (pending === 0 && started === order.length) { settled = true; clearTimeout(timer); reject(lastErr); }
+      };
+
+      const fire = (idx) => {
+        started++; pending++;
+        queryUpstream(UPSTREAMS[idx], dnsMsg)
+          .then((ans) => { pending--; done(null, ans, idx); })
+          .catch((e) => { pending--; done(e, null, idx); });
+      };
+
+      fire(order[0]);
+      timer = setTimeout(() => {
+        if (!settled) for (let i = 1; i < order.length; i++) fire(order[i]);
+      }, FANOUT_DELAY_MS);
+    });
+  }
+
+  cacheGet(key, queryMsg) {
+    const hit = this.cache.get(key);
+    if (!hit) return null;
+    if (hit.expires <= Date.now()) { this.cache.delete(key); return null; }
+    // Replay under the asking query's transaction id.
+    const out = Buffer.from(hit.answer);
+    out[0] = queryMsg[0]; out[1] = queryMsg[1];
+    return out;
+  }
+
+  cachePut(key, answer) {
+    const ttl = answerTtlSeconds(answer);
+    if (ttl == null) return;
+    if (this.cache.size >= CACHE_MAX) {
+      // Drop the oldest insertions; Map keeps insertion order.
+      let n = Math.ceil(CACHE_MAX / 8);
+      for (const k of this.cache.keys()) { this.cache.delete(k); if (--n <= 0) break; }
+    }
+    this.cache.set(key, { answer: Buffer.from(answer), expires: Date.now() + ttl * 1000 });
+  }
+
+  /* Open (and keep) the TLS connections before anyone browses, so the first
+   * real lookup does not pay for a handshake. */
+  warm() {
+    if (this.stopped) return;
+    const probe = buildQuery('cloudflare.com', 1);
+    for (let i = 0; i < UPSTREAMS.length; i++) {
+      queryUpstream(UPSTREAMS[i], probe).catch(() => {});
+    }
   }
 
   start() {
@@ -94,20 +233,54 @@ class DohForwarder {
       sock.on('error', (e) => { this.log('warning', `DoH forwarder: ${e.message}`); try { sock.close(); } catch {} });
       sock.on('message', (msg, rinfo) => {
         if (msg.length < 12 || msg.length > 4096) return; // not a sane DNS query
-        resolveDoH(msg)
-          .then((answer) => { try { sock.send(answer, rinfo.port, rinfo.address); } catch {} })
+        const key = questionKey(msg);
+        if (key) {
+          const hit = this.cacheGet(key, msg);
+          if (hit) { try { sock.send(hit, rinfo.port, rinfo.address); } catch {} return; }
+        }
+        this.resolve(msg)
+          .then((answer) => {
+            if (key) this.cachePut(key, answer);
+            try { sock.send(answer, rinfo.port, rinfo.address); } catch {}
+          })
           .catch(() => { /* drop: the engine falls back to public UDP resolvers */ });
       });
       sock.bind(0, '127.0.0.1', () => {
         this.sock = sock;
         this.port = sock.address().port;
+        this.stopped = false;
+        this.warm();
+        this.warmTimer = setInterval(() => this.warm(), WARM_INTERVAL_MS);
+        if (this.warmTimer.unref) this.warmTimer.unref();
         resolve(this.port);
       });
       sock.once('error', reject);
     });
   }
 
-  stop() { if (this.sock) { try { this.sock.close(); } catch {} this.sock = null; } }
+  stop() {
+    this.stopped = true;
+    if (this.warmTimer) { clearInterval(this.warmTimer); this.warmTimer = null; }
+    this.cache.clear();
+    if (this.sock) { try { this.sock.close(); } catch {} this.sock = null; }
+  }
+}
+
+/* Minimal DNS query builder, used only for the keep-warm probe. */
+function buildQuery(name, qtype) {
+  const labels = name.split('.').filter(Boolean);
+  let len = 12 + 1 + 4;
+  for (const l of labels) len += 1 + l.length;
+  const b = Buffer.alloc(len);
+  b.writeUInt16BE(Math.floor(Math.random() * 65536), 0);
+  b.writeUInt16BE(0x0100, 2);   // RD
+  b.writeUInt16BE(1, 4);        // QDCOUNT
+  let p = 12;
+  for (const l of labels) { b[p++] = l.length; b.write(l, p, 'latin1'); p += l.length; }
+  b[p++] = 0;
+  b.writeUInt16BE(qtype, p); p += 2;
+  b.writeUInt16BE(1, p);        // IN
+  return b;
 }
 
 module.exports = DohForwarder;
