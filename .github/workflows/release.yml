@@ -1,0 +1,143 @@
+name: Build & Release
+
+# Push a tag like v2.3.0 to build every platform on its own native runner and
+# publish a GitHub release. Windows installers are code-signed through SignPath
+# when signing is enabled (repository variable ENABLE_SIGNPATH = true and the
+# SIGNPATH_* secrets/vars are set); otherwise they ship unsigned, exactly as the
+# local builds do today.
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            platform: win
+          - os: macos-latest
+            platform: mac
+          - os: ubuntu-latest
+            platform: linux
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: npm
+
+      # zig cross-compiles the C engine for every OS/arch (scripts find `zig`
+      # on PATH first). Same toolchain family used for local builds.
+      - name: Install zig
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.14.1
+
+      - name: Install Linux build dependencies
+        if: matrix.platform == 'linux'
+        run: sudo apt-get update && sudo apt-get install -y libnetfilter-queue-dev libmnl-dev
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Build engine (all arches)
+        run: node scripts/build-core.js --cross
+
+      - name: Build advanced engine + fetch WinDivert (Windows)
+        if: matrix.platform == 'win'
+        run: |
+          node scripts/build-core-advanced.js
+          npm run fetch:windivert
+
+      - name: Build advanced engine (Linux x64 native, arm64 best-effort)
+        if: matrix.platform == 'linux'
+        run: |
+          node scripts/build-core-advanced.js || true
+          bash scripts/ci-linux-arm64-advanced.sh || echo "arm64 advanced skipped"
+
+      - name: Build web UI
+        run: npm run build
+
+      - name: Package (Windows)
+        if: matrix.platform == 'win'
+        run: npx electron-builder --win --publish never
+
+      - name: Package (macOS)
+        if: matrix.platform == 'mac'
+        env:
+          CSC_IDENTITY_AUTO_DISCOVERY: 'false'
+        run: npx electron-builder --mac --publish never
+
+      - name: Package (Linux)
+        if: matrix.platform == 'linux'
+        run: npx electron-builder --linux AppImage deb --publish never
+
+      # --- Windows code signing via SignPath (off unless enabled) -------------
+      - name: Submit signing request (SignPath)
+        if: matrix.platform == 'win' && vars.ENABLE_SIGNPATH == 'true'
+        uses: signpath/github-action-submit-signing-request@v1.2
+        with:
+          api-token: ${{ secrets.SIGNPATH_API_TOKEN }}
+          organization-id: ${{ vars.SIGNPATH_ORGANIZATION_ID }}
+          project-slug: shroudly
+          signing-policy-slug: ${{ vars.SIGNPATH_POLICY_SLUG }}
+          artifact-configuration-slug: ${{ vars.SIGNPATH_ARTIFACT_SLUG }}
+          github-artifact-id: ''                     # signs the files staged below
+          wait-for-completion: true
+          output-artifact-directory: dist
+          parameters: |
+            version: ${{ github.ref_name }}
+
+      - name: Recompute Windows update metadata after signing
+        if: matrix.platform == 'win' && vars.ENABLE_SIGNPATH == 'true'
+        run: node scripts/recompute-win-latest.js
+
+      - name: Collect artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.platform }}
+          retention-days: 3
+          if-no-files-found: error
+          path: |
+            dist/*.exe
+            dist/*.dmg
+            dist/*.zip
+            dist/*.AppImage
+            dist/*.deb
+            dist/latest*.yml
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    if: startsWith(github.ref, 'refs/tags/')
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+      - name: Download all build artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: dist-all
+      - name: Flatten into dist/
+        run: |
+          mkdir -p dist
+          find dist-all -type f -exec cp -n {} dist/ \;
+          ls -la dist
+      - name: Publish GitHub release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: node scripts/publish-release.js
