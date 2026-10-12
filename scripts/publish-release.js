@@ -62,19 +62,32 @@ async function api(url, opts = {}) {
 (async () => {
   for (const [name] of ASSETS) if (!fs.existsSync(path.join(dist, name))) throw new Error(`missing dist/${name}`);
   cleanWindowsFeed();
-  const notesFile = process.argv[2];
-  const release = await api(`https://api.github.com/repos/${OWNER}/${REPO}/releases`, {
-    method: 'POST',
-    body: JSON.stringify({
-      tag_name: `v${version}`,
-      target_commitish: execSync('git rev-parse HEAD', { cwd: root }).toString().trim(),
-      name: `Shroudly v${version}`,
-      body: notesFile ? fs.readFileSync(notesFile, 'utf8') : '',
-      make_latest: 'true',
-    }),
-  });
-  console.log(`release ${release.html_url}`);
+  // Notes: an explicit file argument, else release-notes/v<version>.md if the
+  // repo has one (that is what the CI release job uses).
+  const repoNotes = path.join(root, 'release-notes', `v${version}.md`);
+  const notesFile = process.argv[2] || (fs.existsSync(repoNotes) ? repoNotes : null);
+
+  // Idempotent: if this version is already released (published locally, or a
+  // re-run), reuse it and upload only the files it is missing.
+  let release = await api(`https://api.github.com/repos/${OWNER}/${REPO}/releases/tags/v${version}`).catch(() => null);
+  if (release) {
+    console.log(`release exists ${release.html_url}`);
+  } else {
+    release = await api(`https://api.github.com/repos/${OWNER}/${REPO}/releases`, {
+      method: 'POST',
+      body: JSON.stringify({
+        tag_name: `v${version}`,
+        target_commitish: execSync('git rev-parse HEAD', { cwd: root }).toString().trim(),
+        name: `Shroudly v${version}`,
+        body: notesFile ? fs.readFileSync(notesFile, 'utf8') : '',
+        make_latest: 'true',
+      }),
+    });
+    console.log(`release ${release.html_url}`);
+  }
+  const have = new Set((release.assets || []).map((a) => a.name));
   for (const [name, label] of ASSETS) {
+    if (have.has(name)) { console.log(`  exists    ${name}`); continue; }
     const data = fs.readFileSync(path.join(dist, name));
     const url = `https://uploads.github.com/repos/${OWNER}/${REPO}/releases/${release.id}/assets?name=${encodeURIComponent(name)}&label=${encodeURIComponent(label)}`;
     const a = await api(url, { method: 'POST', headers: { 'Content-Type': 'application/octet-stream' }, body: data });

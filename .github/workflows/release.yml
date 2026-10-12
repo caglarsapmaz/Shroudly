@@ -83,7 +83,7 @@ jobs:
 
       - name: Package (Linux)
         if: matrix.platform == 'linux'
-        run: npx electron-builder --linux AppImage deb --publish never
+        run: npx electron-builder --linux --publish never   # targets/arches from package.json
 
       # --- Windows code signing via SignPath (off unless enabled) -------------
       - name: Submit signing request (SignPath)
