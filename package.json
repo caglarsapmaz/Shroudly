@@ -1,6 +1,6 @@
 {
   "name": "shroudly",
-  "version": "2.2.0",
+  "version": "2.2.1",
   "description": "Shroudly - Unseen. Unstoppable. | Cross-platform DPI bypass (self-contained engine)",
   "main": "electron/main.js",
   "private": true,
@@ -196,6 +196,7 @@
     "wait-on": "^7.2.0"
   },
   "overrides": {
-    "fast-uri": "3.1.8"
+    "fast-uri": "3.1.8",
+    "js-yaml": "5.4.2"
   }
 }
